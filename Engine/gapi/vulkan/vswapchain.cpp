@@ -8,7 +8,7 @@
 
 #include "vdevice.h"
 
-#if defined(__UNIX__)
+#if defined(__UNIX__) && !defined(__ANDROID__)
 #include "system/api/x11api.h"
 #endif
 
@@ -16,6 +16,9 @@
 #  define VK_USE_PLATFORM_WIN32_KHR
 #  include <windows.h>
 #  include <vulkan/vulkan_win32.h>
+#elif defined(__ANDROID__)
+#  define VK_USE_PLATFORM_ANDROID_KHR
+#  include <vulkan/vulkan_android.h>
 #elif defined(__UNIX__)
 #  define VK_USE_PLATFORM_XLIB_KHR
 #  include <X11/Xlib.h>
@@ -168,6 +171,8 @@ VSwapchain::~VSwapchain() {
 bool VSwapchain::checkPresentSupport(VkPhysicalDevice device, uint32_t queueFamilyIndex) {
 #if defined(__WINDOWS__)
   const bool presentSupport = vkGetPhysicalDeviceWin32PresentationSupportKHR(device, queueFamilyIndex)!=VK_FALSE;
+#elif defined(__ANDROID__)
+  const bool presentSupport = true;
 #elif defined(__UNIX__)
   bool presentSupport = false;
   if(auto dpy = reinterpret_cast<Display*>(X11Api::display())){
@@ -237,6 +242,12 @@ VkSurfaceKHR VSwapchain::createSurface(VkInstance instance, void* hwnd) {
   createInfo.hinstance = GetModuleHandleA(nullptr);
   createInfo.hwnd      = HWND(hwnd);
   if(vkCreateWin32SurfaceKHR(instance,&createInfo,nullptr,&ret)!=VK_SUCCESS)
+    throw std::system_error(Tempest::GraphicsErrc::NoDevice);
+#elif defined(__ANDROID__)
+  VkAndroidSurfaceCreateInfoKHR createInfo = {};
+  createInfo.sType  = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+  createInfo.window = reinterpret_cast<ANativeWindow*>(hwnd);
+  if(vkCreateAndroidSurfaceKHR(instance, &createInfo, nullptr, &ret)!=VK_SUCCESS)
     throw std::system_error(Tempest::GraphicsErrc::NoDevice);
 #elif defined(__UNIX__)
   VkXlibSurfaceCreateInfoKHR createInfo = {};
