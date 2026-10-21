@@ -1,9 +1,14 @@
-#include "systemapi.h"
-
+#if defined(__ANDROID__)
+#include "api/androidapi.h"
+#elif defined(__WINDOWS__)
 #include "api/windowsapi.h"
+#elif defined(__UNIX__)
 #include "api/x11api.h"
+#elif defined(__OSX__)
 #include "api/macosapi.h"
+#elif defined(__IOS__)
 #include "api/iosapi.h"
+#endif
 #include "eventdispatcher.h"
 
 #include <Tempest/Event>
@@ -14,9 +19,9 @@ using namespace Tempest;
 static EventDispatcher dispatcher;
 
 struct SystemApi::Data {
-  std::vector<WindowsApi::TranslateKeyPair> keys;
-  std::vector<WindowsApi::TranslateKeyPair> a, k0, f1;
-  uint16_t                                  fkeysCount=1;
+  std::vector<SystemApi::TranslateKeyPair> keys;
+  std::vector<SystemApi::TranslateKeyPair> a, k0, f1;
+  uint16_t                                 fkeysCount=1;
   };
 SystemApi::Data SystemApi::m;
 
@@ -98,6 +103,8 @@ uint16_t SystemApi::translateKey(uint64_t scancode) {
 SystemApi& SystemApi::inst() {
  #ifdef __WINDOWS__
   static WindowsApi api;
+#elif defined(__ANDROID__)
+  static AndroidApi api;
 #elif defined(__UNIX__)
   static X11Api api;
 #elif defined(__OSX__)
