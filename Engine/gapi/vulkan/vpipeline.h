@@ -48,6 +48,7 @@ class VPipeline : public AbstractGraphicsApi::Pipeline {
 
     IVec3              workGroupSize() const override;
     size_t             sizeofBuffer(size_t id, size_t arraylen) const override;
+    void               prewarm(uint32_t colorAttachmentCount = 1, bool hasDepth = true) override;
 
   private:
     struct InstRp : Inst {

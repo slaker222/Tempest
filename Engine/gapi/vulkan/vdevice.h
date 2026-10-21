@@ -28,7 +28,7 @@ namespace Detail {
 class VTexture;
 
 inline void vkAssert(VkResult code){
-  if(T_LIKELY(code==VkResult::VK_SUCCESS))
+  if(T_LIKELY(code==VkResult::VK_SUCCESS || code==VkResult::VK_SUBOPTIMAL_KHR))
     return;
 
   switch( code ) {

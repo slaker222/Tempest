@@ -17,6 +17,8 @@ class VShader : public Tempest::Detail::Shader {
     ~VShader();
 
     VkShaderModule impl = VK_NULL_HANDLE;
+    size_t         srcSize = 0;
+    uint32_t       spirvHash = 0;
 
   protected:
     VkDevice       device;

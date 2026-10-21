@@ -44,15 +44,32 @@ void Shader::fetchBindings(const uint32_t* source, const size_t size){
     if(i.op()!=spv::OpSource)
       continue;
     uint32_t src = i.length()>3 ? i[3] : 0;
-    if(src==0)
-      continue;
-
-    for(auto& r:code) {
-      if(r.op()==spv::OpString && r[1]==src) {
-        this->dbg.source = reinterpret_cast<const char*>(&r[2]);
-        break;
+    if(src!=0) {
+      for(auto& r:code) {
+        if(r.op()==spv::OpString && r[1]==src) {
+          this->dbg.source = reinterpret_cast<const char*>(&r[2]);
+          break;
+          }
         }
       }
+    if(i.length()>4) {
+      const char* s = reinterpret_cast<const char*>(&i[4]);
+      std::string defs;
+      const char* p = s;
+      while(p!=nullptr && (p = std::strstr(p, "define-macro ")) != nullptr) {
+        p += 13;
+        const char* end = std::strpbrk(p, " \r\n");
+        if(!defs.empty()) defs += " ";
+        if(end!=nullptr) {
+          defs.append(p, end - p);
+          p = end;
+        } else {
+          defs.append(p);
+          break;
+        }
+      }
+      this->dbg.defines = defs;
+    }
     break;
     }
   }

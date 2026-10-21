@@ -531,6 +531,7 @@ namespace Tempest {
       struct Pipeline:Shared {
         virtual IVec3  workGroupSize() const = 0;
         virtual size_t sizeofBuffer(size_t id, size_t arraylen) const = 0;
+        virtual void   prewarm(uint32_t colorAttachmentCount = 1, bool hasDepth = true) {}
         };
       struct CompPipeline:Shared {
         virtual IVec3  workGroupSize() const = 0;

@@ -5,6 +5,7 @@
 #include "vcommandbuffer.h"
 #include "vfence.h"
 #include "vswapchain.h"
+#include "vpipelinelogger.h"
 
 #include <Tempest/Application>
 #include <Tempest/Log>
@@ -82,7 +83,17 @@ VkResult VDevice::Queue::present(VkPresentInfoKHR& presentInfo) {
 VDevice::VDevice(VkInstance instance, const bool hasDeviceFeatures2, VkPhysicalDevice pdev)
   :instance(instance), hasDeviceFeatures2(hasDeviceFeatures2),
     fboMap(*this), setLayouts(*this), psoLayouts(*this), descPool(*this), bindless(*this) {
+  opengothic_debug_init();
   deviceProps(instance, hasDeviceFeatures2, pdev, props);
+  if(opengothic_debug_no_dynrendering()) {
+    props.hasDynRendering = false;
+  }
+  if(opengothic_debug_no_bindless()) {
+    props.descriptors.nonUniformIndexing = false;
+    props.descriptors.maxSamplers = 0;
+    props.descriptors.maxTexture  = 0;
+    props.descriptors.maxStorage  = 0;
+  }
   deviceQueueProps(pdev, props);
 
   createLogicalDevice(pdev);
@@ -306,6 +317,50 @@ void VDevice::createLogicalDevice(VkPhysicalDevice pdev) {
     if(vkCreateDevice(pdev, &createInfo, nullptr, &device.impl)!=VK_SUCCESS)
       throw std::system_error(Tempest::GraphicsErrc::NoDevice);
     }
+
+  {
+    VkPhysicalDeviceProperties devP = {};
+    vkGetPhysicalDeviceProperties(pdev, &devP);
+
+    char featBuf[1024];
+    snprintf(featBuf, sizeof(featBuf),
+      "    dynamicRendering:    %d\n"
+      "    descriptorIndexing:  %d\n"
+      "    nonUniformIndexing:  %d (maxTexture=%u, maxStorage=%u)\n"
+      "    multiDrawIndirect:   %d\n"
+      "    bufferDeviceAddress: %d\n"
+      "    synchronization2:    %d\n"
+      "    meshShader:          %d, taskShader: %d\n"
+      "    rayQuery:            %d\n"
+      "    shaderInt16:         %d, shaderInt64: %d\n"
+      "    tesselationShader:   %d, geometryShader: %d",
+      props.hasDynRendering ? 1 : 0,
+      props.hasDescIndexing ? 1 : 0,
+      props.descriptors.nonUniformIndexing ? 1 : 0,
+      props.descriptors.maxTexture, props.descriptors.maxStorage,
+      supportedFeatures.multiDrawIndirect ? 1 : 0,
+      props.hasDeviceAddress ? 1 : 0,
+      props.hasSync2 ? 1 : 0,
+      props.meshlets.meshShader ? 1 : 0,
+      props.meshlets.taskShader ? 1 : 0,
+      props.raytracing.rayQuery ? 1 : 0,
+      supportedFeatures.shaderInt16 ? 1 : 0,
+      supportedFeatures.shaderInt64 ? 1 : 0,
+      props.tesselationShader ? 1 : 0,
+      props.geometryShader ? 1 : 0
+    );
+
+    opengothic_log_device_info(
+      devP.deviceName,
+      devP.apiVersion,
+      devP.driverVersion,
+      devP.vendorID,
+      devP.deviceID,
+      rqExt.data(),
+      rqExt.size(),
+      featBuf
+    );
+  }
 
   for(size_t i=0; i<queueCnt; ++i) {
     vkGetDeviceQueue(device.impl, queues[i].family, 0, &queues[i].impl);

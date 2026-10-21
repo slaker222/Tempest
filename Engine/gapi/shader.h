@@ -30,6 +30,8 @@ class Shader : public AbstractGraphicsApi::Shader {
       };
     struct Dbg {
       std::string source;
+      std::string defines;
+      std::string tag;
       };
 
     ShaderReflection::Stage stage = ShaderReflection::Stage::Compute;

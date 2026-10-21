@@ -24,6 +24,11 @@ float                     AndroidApi::touchStartX     = 0.0f;
 float                     AndroidApi::touchStartY     = 0.0f;
 uint64_t                  AndroidApi::touchStartTime  = 0;
 bool                      AndroidApi::touchActive     = false;
+AndroidApi::TouchHook     AndroidApi::touchHook       = nullptr;
+
+void AndroidApi::setTouchHook(TouchHook hook) {
+  touchHook = hook;
+  }
 
 AndroidApi::AndroidApi() {
   }
@@ -206,72 +211,33 @@ void AndroidApi::implProcessEvents(AppCallBack& /*cb*/) {
 
   // Touch events handling
   for(const auto& te : tEvents) {
+    if(touchHook != nullptr && touchHook(te.action, te.x, te.y, te.id)) {
+      continue;
+      }
+
     int x = static_cast<int>(te.x);
     int y = static_cast<int>(te.y);
 
-    if(te.action == 0) { // ACTION_DOWN
+    if(te.action == 0 || te.action == 5) { // ACTION_DOWN / ACTION_POINTER_DOWN
       touchStartX    = te.x;
       touchStartY    = te.y;
       touchStartTime = Application::tickCount();
       touchActive    = true;
 
-      MouseEvent mv(x, y, Event::ButtonNone, Event::M_NoModifier, 0, 0, Event::MouseMove);
+      MouseEvent mv(x, y, Event::ButtonNone, Event::M_NoModifier, 0, te.id, Event::MouseMove);
       SystemApi::dispatchMouseMove(*currentOwner, mv);
 
-      MouseEvent md(x, y, Event::ButtonLeft, Event::M_NoModifier, 0, 0, Event::MouseDown);
+      MouseEvent md(x, y, Event::ButtonLeft, Event::M_NoModifier, 0, te.id, Event::MouseDown);
       SystemApi::dispatchMouseDown(*currentOwner, md);
       }
     else if(te.action == 2) { // ACTION_MOVE
-      MouseEvent mv(x, y, Event::ButtonLeft, Event::M_NoModifier, 0, 0, Event::MouseMove);
+      MouseEvent mv(x, y, Event::ButtonLeft, Event::M_NoModifier, 0, te.id, Event::MouseMove);
       SystemApi::dispatchMouseMove(*currentOwner, mv);
       }
-    else if(te.action == 1) { // ACTION_UP
-      MouseEvent mu(x, y, Event::ButtonLeft, Event::M_NoModifier, 0, 0, Event::MouseUp);
+    else if(te.action == 1 || te.action == 6 || te.action == 3) { // ACTION_UP / ACTION_POINTER_UP / ACTION_CANCEL
+      MouseEvent mu(x, y, Event::ButtonLeft, Event::M_NoModifier, 0, te.id, Event::MouseUp);
       SystemApi::dispatchMouseUp(*currentOwner, mu);
-
-      if(touchActive) {
-        touchActive = false;
-        float dx = te.x - touchStartX;
-        float dy = te.y - touchStartY;
-        uint64_t dt = Application::tickCount() - touchStartTime;
-
-        // Gestures / Virtual navigation for Menu & Game:
-        if(std::abs(dx) < 40.0f && std::abs(dy) < 40.0f && dt < 400) {
-          // TAP: Enter / Action / Selection
-          KeyEvent kd(Event::K_Return, uint32_t('\n'), Event::M_NoModifier, Event::KeyDown);
-          KeyEvent ku(Event::K_Return, uint32_t('\n'), Event::M_NoModifier, Event::KeyUp);
-          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
-          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
-          }
-        else if(dy > 50.0f && std::abs(dy) > 1.3f * std::abs(dx)) {
-          // SWIPE DOWN: Navigate Down
-          KeyEvent kd(Event::K_Down, 0, Event::M_NoModifier, Event::KeyDown);
-          KeyEvent ku(Event::K_Down, 0, Event::M_NoModifier, Event::KeyUp);
-          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
-          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
-          }
-        else if(dy < -50.0f && std::abs(dy) > 1.3f * std::abs(dx)) {
-          // SWIPE UP: Navigate Up
-          KeyEvent kd(Event::K_Up, 0, Event::M_NoModifier, Event::KeyDown);
-          KeyEvent ku(Event::K_Up, 0, Event::M_NoModifier, Event::KeyUp);
-          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
-          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
-          }
-        else if(dx > 50.0f && std::abs(dx) > 1.3f * std::abs(dy)) {
-          // SWIPE RIGHT: Navigate Right
-          KeyEvent kd(Event::K_Right, 0, Event::M_NoModifier, Event::KeyDown);
-          KeyEvent ku(Event::K_Right, 0, Event::M_NoModifier, Event::KeyUp);
-          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
-          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
-          }
-        else if(dx < -50.0f && std::abs(dx) > 1.3f * std::abs(dy)) {
-          // SWIPE LEFT: Navigate Left
-          KeyEvent kd(Event::K_Left, 0, Event::M_NoModifier, Event::KeyDown);
-          KeyEvent ku(Event::K_Left, 0, Event::M_NoModifier, Event::KeyUp);
-          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
-          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
-          }
-        }
+      touchActive = false;
       }
     }
   }

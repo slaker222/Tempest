@@ -276,7 +276,11 @@ void VSwapchain::createSwapchain(VDevice& device) {
       auto     support  = device.querySwapChainSupport(surface);
       uint32_t imgCount = findImageCount(support);
       auto     code     = createSwapchain(device,support,rect,imgCount);
+#ifndef __ANDROID__
       if(code==VK_ERROR_OUT_OF_DATE_KHR || code==VK_SUBOPTIMAL_KHR) {
+#else
+      if(code==VK_ERROR_OUT_OF_DATE_KHR) {
+#endif
         cleanupSwapchain();
         continue;
         }
@@ -320,7 +324,15 @@ VkResult VSwapchain::createSwapchain(VDevice& device, const SwapChainSupport& sw
     createInfo.imageSharingMode      = VK_SHARING_MODE_EXCLUSIVE;
     }
 
+#if defined(__ANDROID__)
+  if(swapChainSupport.capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+    createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  } else {
+    createInfo.preTransform = swapChainSupport.capabilities.currentTransform;
+  }
+#else
   createInfo.preTransform   = swapChainSupport.capabilities.currentTransform;
+#endif
   createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
   createInfo.presentMode    = presentMode;
   createInfo.clipped        = VK_FALSE;
@@ -408,17 +420,35 @@ VkPresentModeKHR VSwapchain::findSwapPresentMode(const std::vector<VkPresentMode
 
 VkExtent2D VSwapchain::findSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities,
                                       uint32_t w,uint32_t h) {
+#if !defined(__ANDROID__)
   if(capabilities.currentExtent.width!=std::numeric_limits<uint32_t>::max()) {
     return capabilities.currentExtent;
     }
+#endif
+
+  uint32_t minW = capabilities.minImageExtent.width;
+  uint32_t maxW = capabilities.maxImageExtent.width;
+  uint32_t minH = capabilities.minImageExtent.height;
+  uint32_t maxH = capabilities.maxImageExtent.height;
+
+#if defined(__ANDROID__)
+  if((w > h && minW < minH) || (w < h && minW > minH)) {
+    std::swap(minW, minH);
+    std::swap(maxW, maxH);
+  }
+#endif
 
   VkExtent2D actualExtent = {
     static_cast<uint32_t>(w),
     static_cast<uint32_t>(h)
     };
 
-  actualExtent.width  = std::clamp(actualExtent.width,  capabilities.minImageExtent.width,  capabilities.maxImageExtent.width );
-  actualExtent.height = std::clamp(actualExtent.height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
+  actualExtent.width  = std::clamp(actualExtent.width,  minW, maxW);
+  actualExtent.height = std::clamp(actualExtent.height, minH, maxH);
+
+  Log::i("VSwapchain::findSwapExtent: requested=", w, "x", h,
+         " capabilities.currentExtent=", capabilities.currentExtent.width, "x", capabilities.currentExtent.height,
+         " result=", actualExtent.width, "x", actualExtent.height);
 
   return actualExtent;
   }
@@ -439,8 +469,13 @@ uint32_t VSwapchain::findImageCount(const SwapChainSupport& support) const {
 void VSwapchain::acquireNextImage() {
   VkResult code = implAcquireNextImage();
 
+#ifndef __ANDROID__
   if(code==VK_ERROR_OUT_OF_DATE_KHR || code==VK_SUBOPTIMAL_KHR)
     throw SwapchainSuboptimal();
+#else
+  if(code==VK_ERROR_OUT_OF_DATE_KHR)
+    throw SwapchainSuboptimal();
+#endif
 
   if(code!=VK_SUCCESS)
     vkAssert(code);
@@ -531,8 +566,13 @@ void VSwapchain::present() {
 
   auto tx = Application::tickCount();
   VkResult code = device.presentQueue->present(presentInfo);
+#ifndef __ANDROID__
   if(code==VK_ERROR_OUT_OF_DATE_KHR || code==VK_SUBOPTIMAL_KHR)
     throw SwapchainSuboptimal();
+#else
+  if(code==VK_ERROR_OUT_OF_DATE_KHR)
+    throw SwapchainSuboptimal();
+#endif
   tx = Application::tickCount()-tx;
   if(tx > 2) {
     // std::chrono::system_clock::time_point p = std::chrono::system_clock::now();

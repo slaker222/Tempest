@@ -16,3 +16,8 @@ RenderPipeline &RenderPipeline::operator =(RenderPipeline&& other) {
 size_t RenderPipeline::sizeofBuffer(size_t layoutBind, size_t arraylen) const {
   return impl.handler->sizeofBuffer(layoutBind, arraylen);
   }
+
+void RenderPipeline::prewarm(uint32_t colorAttachmentCount, bool hasDepth) {
+  if(impl.handler!=nullptr)
+    impl.handler->prewarm(colorAttachmentCount, hasDepth);
+  }

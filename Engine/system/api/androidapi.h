@@ -33,6 +33,9 @@ class AndroidApi final: public SystemApi {
       int keyCode;
       };
 
+    using TouchHook = bool (*)(int action, float x, float y, int id);
+    static void setTouchHook(TouchHook hook);
+
     static void  setNativeWindow(ANativeWindow* window);
     static void* nativeWindow();
     static void  notifySurfaceChanged(int width, int height);
@@ -75,6 +78,7 @@ class AndroidApi final: public SystemApi {
     static float                     touchStartY;
     static uint64_t                  touchStartTime;
     static bool                      touchActive;
+    static TouchHook                 touchHook;
 
   friend class SystemApi;
   };

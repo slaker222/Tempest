@@ -22,6 +22,7 @@ class RenderPipeline final {
     bool isEmpty() const { return impl.handler==nullptr; }
 
     size_t sizeofBuffer(size_t layoutBind, size_t arraylen = 0) const;
+    void   prewarm(uint32_t colorAttachmentCount = 1, bool hasDepth = true);
 
   private:
     RenderPipeline(Detail::DSharedPtr<AbstractGraphicsApi::Pipeline*>&& p);

@@ -65,6 +65,8 @@ class VFramebufferMap {
 
     std::mutex         syncRp;
     std::vector<std::shared_ptr<RenderPass>> rp;
+
+  friend class VPipeline;
   };
 
 }
