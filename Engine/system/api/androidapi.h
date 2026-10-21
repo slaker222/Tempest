@@ -2,6 +2,11 @@
 
 #include <Tempest/SystemApi>
 #include <atomic>
+#include <mutex>
+#include <vector>
+#include <condition_variable>
+
+struct ANativeWindow;
 
 namespace Tempest {
 
@@ -16,12 +21,27 @@ class AndroidApi final: public SystemApi {
     using SystemApi::dispatchKeyDown;
     using SystemApi::dispatchKeyUp;
 
-    // Временные заглушки для Этапа 1 (будут полноценно реализованы на Этапе 2)
-    static void  setNativeWindow(void* window);
+    struct TouchEvent {
+      int   action;
+      float x;
+      float y;
+      int   id;
+      };
+
+    struct KeyEventData {
+      int action;
+      int keyCode;
+      };
+
+    static void  setNativeWindow(ANativeWindow* window);
     static void* nativeWindow();
+    static void  notifySurfaceChanged(int width, int height);
+    static void  pushTouchEvent(int action, float x, float y, int id);
+    static void  pushKeyEvent(int action, int keyCode);
 
   private:
     AndroidApi();
+    ~AndroidApi() override;
 
     Window*  implCreateWindow(Tempest::Window *owner, uint32_t width, uint32_t height) override;
     Window*  implCreateWindow(Tempest::Window *owner, ShowMode sm) override;
@@ -41,8 +61,20 @@ class AndroidApi final: public SystemApi {
 
     void     implSetWindowTitle(SystemApi::Window *w, const char* utf8) override;
 
-    static std::atomic_bool isExit;
-    static void*            currentNativeWindow;
+    static std::atomic_bool          isExit;
+    static ANativeWindow*            currentNativeWindow;
+    static Tempest::Window*          currentOwner;
+    static std::mutex                windowSync;
+    static std::condition_variable   windowCv;
+
+    static std::mutex                eventSync;
+    static std::vector<TouchEvent>   touchEvents;
+    static std::vector<KeyEventData> keyEvents;
+
+    static float                     touchStartX;
+    static float                     touchStartY;
+    static uint64_t                  touchStartTime;
+    static bool                      touchActive;
 
   friend class SystemApi;
   };

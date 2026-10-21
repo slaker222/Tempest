@@ -1,27 +1,100 @@
 #include "androidapi.h"
 
 #include <Tempest/Window>
+#include <Tempest/Application>
 #include <Tempest/Log>
+#include <android/native_window.h>
+#include <cmath>
+#include <thread>
+#include <chrono>
 
 using namespace Tempest;
 
-std::atomic_bool AndroidApi::isExit{false};
-void*            AndroidApi::currentNativeWindow = nullptr;
+std::atomic_bool          AndroidApi::isExit{false};
+ANativeWindow*            AndroidApi::currentNativeWindow = nullptr;
+Tempest::Window*          AndroidApi::currentOwner        = nullptr;
+std::mutex                AndroidApi::windowSync;
+std::condition_variable   AndroidApi::windowCv;
+
+std::mutex                AndroidApi::eventSync;
+std::vector<AndroidApi::TouchEvent>   AndroidApi::touchEvents;
+std::vector<AndroidApi::KeyEventData> AndroidApi::keyEvents;
+
+float                     AndroidApi::touchStartX     = 0.0f;
+float                     AndroidApi::touchStartY     = 0.0f;
+uint64_t                  AndroidApi::touchStartTime  = 0;
+bool                      AndroidApi::touchActive     = false;
 
 AndroidApi::AndroidApi() {
   }
 
-void AndroidApi::setNativeWindow(void* window) {
+AndroidApi::~AndroidApi() {
+  setNativeWindow(nullptr);
+  }
+
+void AndroidApi::setNativeWindow(ANativeWindow* window) {
+  std::lock_guard<std::mutex> lk(windowSync);
+  if(currentNativeWindow != nullptr && currentNativeWindow != window) {
+    ANativeWindow_release(currentNativeWindow);
+    }
   currentNativeWindow = window;
+  if(currentNativeWindow != nullptr) {
+    ANativeWindow_acquire(currentNativeWindow);
+    int32_t w = ANativeWindow_getWidth(currentNativeWindow);
+    int32_t h = ANativeWindow_getHeight(currentNativeWindow);
+    Log::i("AndroidApi::setNativeWindow: ", window, " size: ", w, "x", h);
+    } else {
+    Log::i("AndroidApi::setNativeWindow: null");
+    }
+  windowCv.notify_all();
+
+  if(currentOwner != nullptr && currentNativeWindow != nullptr) {
+    int32_t w = ANativeWindow_getWidth(currentNativeWindow);
+    int32_t h = ANativeWindow_getHeight(currentNativeWindow);
+    if(w > 0 && h > 0) {
+      SizeEvent ev(w, h);
+      SystemApi::dispatchResize(*currentOwner, ev);
+      }
+    }
   }
 
 void* AndroidApi::nativeWindow() {
   return currentNativeWindow;
   }
 
-SystemApi::Window* AndroidApi::implCreateWindow(Tempest::Window* /*owner*/, uint32_t /*width*/, uint32_t /*height*/) {
-  // STUB (Этап 1): временная заглушка дескриптора окна до Этапа 2
-  return reinterpret_cast<SystemApi::Window*>(currentNativeWindow ? currentNativeWindow : reinterpret_cast<void*>(0x1));
+void AndroidApi::notifySurfaceChanged(int width, int height) {
+  Log::i("AndroidApi::notifySurfaceChanged: ", width, "x", height);
+  if(currentOwner != nullptr && width > 0 && height > 0) {
+    SizeEvent ev(width, height);
+    SystemApi::dispatchResize(*currentOwner, ev);
+    }
+  }
+
+void AndroidApi::pushTouchEvent(int action, float x, float y, int id) {
+  std::lock_guard<std::mutex> lk(eventSync);
+  touchEvents.push_back({action, x, y, id});
+  }
+
+void AndroidApi::pushKeyEvent(int action, int keyCode) {
+  std::lock_guard<std::mutex> lk(eventSync);
+  keyEvents.push_back({action, keyCode});
+  }
+
+SystemApi::Window* AndroidApi::implCreateWindow(Tempest::Window* owner, uint32_t /*width*/, uint32_t /*height*/) {
+  Log::i("AndroidApi::implCreateWindow waiting for ANativeWindow...");
+  std::unique_lock<std::mutex> lk(windowSync);
+  windowCv.wait(lk, []{ return currentNativeWindow != nullptr || isExit.load(); });
+
+  if(isExit.load() || currentNativeWindow == nullptr) {
+    Log::e("AndroidApi::implCreateWindow: cancelled or null window");
+    return nullptr;
+    }
+
+  currentOwner = owner;
+  int32_t w = ANativeWindow_getWidth(currentNativeWindow);
+  int32_t h = ANativeWindow_getHeight(currentNativeWindow);
+  Log::i("AndroidApi::implCreateWindow ready with ANativeWindow: ", currentNativeWindow, " (", w, "x", h, ")");
+  return reinterpret_cast<SystemApi::Window*>(currentNativeWindow);
   }
 
 SystemApi::Window* AndroidApi::implCreateWindow(Tempest::Window* owner, ShowMode /*sm*/) {
@@ -29,15 +102,23 @@ SystemApi::Window* AndroidApi::implCreateWindow(Tempest::Window* owner, ShowMode
   }
 
 void AndroidApi::implDestroyWindow(Window* /*w*/) {
-  // STUB (Этап 1)
+  std::lock_guard<std::mutex> lk(windowSync);
+  currentOwner = nullptr;
   }
 
 void AndroidApi::implExit() {
   isExit.store(true);
+  windowCv.notify_all();
   }
 
-Rect AndroidApi::implWindowClientRect(SystemApi::Window* /*w*/) {
-  // STUB (Этап 1): возвращает базовое разрешение мобильного экрана
+Rect AndroidApi::implWindowClientRect(SystemApi::Window* w) {
+  ANativeWindow* win = reinterpret_cast<ANativeWindow*>(w ? w : reinterpret_cast<SystemApi::Window*>(currentNativeWindow));
+  if(win != nullptr) {
+    int32_t width  = ANativeWindow_getWidth(win);
+    int32_t height = ANativeWindow_getHeight(win);
+    if(width > 0 && height > 0)
+      return Rect(0, 0, width, height);
+    }
   return Rect(0, 0, 1920, 1080);
   }
 
@@ -50,7 +131,6 @@ bool AndroidApi::implIsFullscreen(SystemApi::Window* /*w*/) {
   }
 
 void AndroidApi::implSetCursorPosition(SystemApi::Window* /*w*/, int /*x*/, int /*y*/) {
-  // На сенсорном экране отсутствует аппаратный курсор мыши
   }
 
 void AndroidApi::implShowCursor(SystemApi::Window* /*w*/, CursorShape /*cursor*/) {
@@ -61,17 +141,139 @@ bool AndroidApi::implIsRunning() {
   }
 
 int AndroidApi::implExec(AppCallBack& cb) {
-  // STUB (Этап 1): в shared library не блокируем основной поток Android
+  Log::i("AndroidApi::implExec game render loop started");
   while(!isExit.load()) {
     implProcessEvents(cb);
-    break;
+
+    if(cb.onTimer() == 0) {
+      std::this_thread::yield();
+      }
+
+    if(currentOwner != nullptr && currentNativeWindow != nullptr) {
+      try {
+        SystemApi::dispatchRender(*currentOwner);
+        }
+      catch(const std::exception& e) {
+        Log::e("dispatchRender error: ", e.what());
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+      catch(...) {
+        Log::e("dispatchRender unknown error");
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+      } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(16));
+      }
     }
+  Log::i("AndroidApi::implExec game render loop finished");
   return 0;
   }
 
-void AndroidApi::implProcessEvents(AppCallBack& cb) {
-  // STUB (Этап 1): опрос таймеров
-  cb.onTimer();
+void AndroidApi::implProcessEvents(AppCallBack& /*cb*/) {
+  std::vector<TouchEvent>   tEvents;
+  std::vector<KeyEventData> kEvents;
+  {
+    std::lock_guard<std::mutex> lk(eventSync);
+    tEvents.swap(touchEvents);
+    kEvents.swap(keyEvents);
+    }
+
+  if(currentOwner == nullptr)
+    return;
+
+  // Key events handling
+  for(const auto& ke : kEvents) {
+    Event::KeyType k = Event::K_NoKey;
+    switch(ke.keyCode) {
+      case 4:   k = Event::K_ESCAPE; break; // KEYCODE_BACK
+      case 19:  k = Event::K_Up;     break; // KEYCODE_DPAD_UP
+      case 20:  k = Event::K_Down;   break; // KEYCODE_DPAD_DOWN
+      case 21:  k = Event::K_Left;   break; // KEYCODE_DPAD_LEFT
+      case 22:  k = Event::K_Right;  break; // KEYCODE_DPAD_RIGHT
+      case 23:
+      case 66:  k = Event::K_Return; break; // KEYCODE_ENTER / DPAD_CENTER
+      case 62:  k = Event::K_Space;  break; // KEYCODE_SPACE
+      default:  break;
+      }
+    if(k != Event::K_NoKey) {
+      KeyEvent ev(k, 0, Event::M_NoModifier, ke.action == 0 ? Event::KeyDown : Event::KeyUp);
+      if(ke.action == 0)
+        SystemApi::dispatchKeyDown(*currentOwner, ev, ke.keyCode);
+      else
+        SystemApi::dispatchKeyUp(*currentOwner, ev, ke.keyCode);
+      }
+    }
+
+  // Touch events handling
+  for(const auto& te : tEvents) {
+    int x = static_cast<int>(te.x);
+    int y = static_cast<int>(te.y);
+
+    if(te.action == 0) { // ACTION_DOWN
+      touchStartX    = te.x;
+      touchStartY    = te.y;
+      touchStartTime = Application::tickCount();
+      touchActive    = true;
+
+      MouseEvent mv(x, y, Event::ButtonNone, Event::M_NoModifier, 0, 0, Event::MouseMove);
+      SystemApi::dispatchMouseMove(*currentOwner, mv);
+
+      MouseEvent md(x, y, Event::ButtonLeft, Event::M_NoModifier, 0, 0, Event::MouseDown);
+      SystemApi::dispatchMouseDown(*currentOwner, md);
+      }
+    else if(te.action == 2) { // ACTION_MOVE
+      MouseEvent mv(x, y, Event::ButtonLeft, Event::M_NoModifier, 0, 0, Event::MouseMove);
+      SystemApi::dispatchMouseMove(*currentOwner, mv);
+      }
+    else if(te.action == 1) { // ACTION_UP
+      MouseEvent mu(x, y, Event::ButtonLeft, Event::M_NoModifier, 0, 0, Event::MouseUp);
+      SystemApi::dispatchMouseUp(*currentOwner, mu);
+
+      if(touchActive) {
+        touchActive = false;
+        float dx = te.x - touchStartX;
+        float dy = te.y - touchStartY;
+        uint64_t dt = Application::tickCount() - touchStartTime;
+
+        // Gestures / Virtual navigation for Menu & Game:
+        if(std::abs(dx) < 40.0f && std::abs(dy) < 40.0f && dt < 400) {
+          // TAP: Enter / Action / Selection
+          KeyEvent kd(Event::K_Return, uint32_t('\n'), Event::M_NoModifier, Event::KeyDown);
+          KeyEvent ku(Event::K_Return, uint32_t('\n'), Event::M_NoModifier, Event::KeyUp);
+          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
+          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
+          }
+        else if(dy > 50.0f && std::abs(dy) > 1.3f * std::abs(dx)) {
+          // SWIPE DOWN: Navigate Down
+          KeyEvent kd(Event::K_Down, 0, Event::M_NoModifier, Event::KeyDown);
+          KeyEvent ku(Event::K_Down, 0, Event::M_NoModifier, Event::KeyUp);
+          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
+          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
+          }
+        else if(dy < -50.0f && std::abs(dy) > 1.3f * std::abs(dx)) {
+          // SWIPE UP: Navigate Up
+          KeyEvent kd(Event::K_Up, 0, Event::M_NoModifier, Event::KeyDown);
+          KeyEvent ku(Event::K_Up, 0, Event::M_NoModifier, Event::KeyUp);
+          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
+          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
+          }
+        else if(dx > 50.0f && std::abs(dx) > 1.3f * std::abs(dy)) {
+          // SWIPE RIGHT: Navigate Right
+          KeyEvent kd(Event::K_Right, 0, Event::M_NoModifier, Event::KeyDown);
+          KeyEvent ku(Event::K_Right, 0, Event::M_NoModifier, Event::KeyUp);
+          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
+          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
+          }
+        else if(dx < -50.0f && std::abs(dx) > 1.3f * std::abs(dy)) {
+          // SWIPE LEFT: Navigate Left
+          KeyEvent kd(Event::K_Left, 0, Event::M_NoModifier, Event::KeyDown);
+          KeyEvent ku(Event::K_Left, 0, Event::M_NoModifier, Event::KeyUp);
+          SystemApi::dispatchKeyDown(*currentOwner, kd, 0);
+          SystemApi::dispatchKeyUp(*currentOwner, ku, 0);
+          }
+        }
+      }
+    }
   }
 
 void AndroidApi::implSetWindowTitle(SystemApi::Window* /*w*/, const char* /*utf8*/) {
