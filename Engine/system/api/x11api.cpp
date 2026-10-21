@@ -1,6 +1,4 @@
-#include "x11api.h"
-
-#ifdef __UNIX__
+#if defined(__UNIX__) && !defined(__ANDROID__)
 #include <Tempest/Event>
 #include <Tempest/TextCodec>
 #include <Tempest/Window>
