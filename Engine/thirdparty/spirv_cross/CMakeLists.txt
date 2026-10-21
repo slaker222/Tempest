@@ -117,7 +117,7 @@ if (CMAKE_COMPILER_IS_GNUCXX OR ((${CMAKE_CXX_COMPILER_ID} MATCHES "Clang") AND 
 		endif()
 	endif()
 	if (SPIRV_CROSS_WERROR)
-		set(spirv-compiler-options ${spirv-compiler-options} -Werror)
+		set(spirv-compiler-options ${spirv-compiler-options} )
 	endif()
 
 	if (SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS)
