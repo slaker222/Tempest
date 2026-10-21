@@ -276,7 +276,7 @@ else()
     endif()
 
     if(ALSOFT_WERROR)
-        set(C_FLAGS ${C_FLAGS} -Werror)
+        set(C_FLAGS ${C_FLAGS} )
     endif()
 
     # We want RelWithDebInfo to actually include debug stuff (define _DEBUG
@@ -344,7 +344,7 @@ if(NOT LIBTYPE STREQUAL "STATIC")
     else()
         set(OLD_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS}")
         # Yes GCC, really don't accept visibility modes you don't support
-        set(CMAKE_REQUIRED_FLAGS "${OLD_REQUIRED_FLAGS} -Wattributes -Werror")
+        set(CMAKE_REQUIRED_FLAGS "${OLD_REQUIRED_FLAGS} -Wattributes ")
 
         check_c_source_compiles("int foo() __attribute__((visibility(\"protected\")));
                                 int main() {return 0;}" HAVE_GCC_PROTECTED_VISIBILITY)
@@ -372,7 +372,7 @@ set(SSE2_SWITCH "")
 if(NOT MSVC)
     set(OLD_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS})
     # Yes GCC, really don't accept command line options you don't support
-    set(CMAKE_REQUIRED_FLAGS "${OLD_REQUIRED_FLAGS} -Werror")
+    set(CMAKE_REQUIRED_FLAGS "${OLD_REQUIRED_FLAGS} ")
     check_c_compiler_flag(-msse2 HAVE_MSSE2_SWITCH)
     if(HAVE_MSSE2_SWITCH)
         set(SSE2_SWITCH "-msse2")
