@@ -29,6 +29,10 @@ struct Config {
   int no_multidraw    = 0;
   int skip_hiz        = 0;
   int skip_shadows    = 0;
+  int skip_lights     = 0;
+  int skip_fog        = 0;
+  int skip_gbuf       = 0;
+  int skip_atest      = 0;
   int spirv_noopt     = 0;
   int no_atest_depth  = 0;
   int prewarm         = 0;
@@ -145,6 +149,10 @@ void opengothic_debug_init() {
         else if(strcmp(k, "no_multidraw") == 0) s_config.no_multidraw = val;
         else if(strcmp(k, "skip_hiz") == 0) s_config.skip_hiz = val;
         else if(strcmp(k, "skip_shadows") == 0) s_config.skip_shadows = val;
+        else if(strcmp(k, "skip_lights") == 0) s_config.skip_lights = val;
+        else if(strcmp(k, "skip_fog") == 0) s_config.skip_fog = val;
+        else if(strcmp(k, "skip_gbuf") == 0) s_config.skip_gbuf = val;
+        else if(strcmp(k, "skip_atest") == 0) s_config.skip_atest = val;
         else if(strcmp(k, "no_atest_depth") == 0) s_config.no_atest_depth = val;
         else if(strcmp(k, "prewarm") == 0) s_config.prewarm = val;
         else if(strcmp(k, "spirv_noopt") == 0) s_config.spirv_noopt = val;
@@ -217,6 +225,10 @@ int  opengothic_debug_no_dynrendering() { if(!s_config.loaded) opengothic_debug_
 int  opengothic_debug_no_multidraw()    { if(!s_config.loaded) opengothic_debug_init(); return s_config.no_multidraw; }
 int  opengothic_debug_skip_hiz()        { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_hiz; }
 int  opengothic_debug_skip_shadows()    { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_shadows; }
+int  opengothic_debug_skip_lights()     { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_lights; }
+int  opengothic_debug_skip_fog()        { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_fog; }
+int  opengothic_debug_skip_gbuf()       { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_gbuf; }
+int  opengothic_debug_skip_atest()      { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_atest; }
 int  opengothic_debug_no_atest_depth()  { if(!s_config.loaded) opengothic_debug_init(); return s_config.no_atest_depth; }
 int  opengothic_debug_prewarm()         { if(!s_config.loaded) opengothic_debug_init(); return s_config.prewarm; }
 int  opengothic_debug_spirv_noopt()     { if(!s_config.loaded) opengothic_debug_init(); return s_config.spirv_noopt; }

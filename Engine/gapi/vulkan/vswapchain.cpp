@@ -303,6 +303,7 @@ VkResult VSwapchain::createSwapchain(VDevice& device, const SwapChainSupport& sw
   VkSurfaceFormatKHR surfaceFormat = findSwapSurfaceFormat(swapChainSupport.formats);
   VkPresentModeKHR   presentMode   = findSwapPresentMode  (swapChainSupport.presentModes);
   VkExtent2D         extent        = findSwapExtent       (swapChainSupport.capabilities,uint32_t(rect.w),uint32_t(rect.h));
+  Log::i("VSwapchain: presentMode=", presentMode, " imgCount=", imgCount);
 
   VkSwapchainCreateInfoKHR createInfo = {};
   createInfo.sType            = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -402,10 +403,17 @@ VkPresentModeKHR VSwapchain::findSwapPresentMode(const std::vector<VkPresentMode
     * https://software.intel.com/content/www/us/en/develop/articles/api-without-secrets-introduction-to-vulkan-part-2.html
     **/
   std::initializer_list<VkPresentModeKHR> modes={
+#if defined(__ANDROID__)
+    VK_PRESENT_MODE_MAILBOX_KHR,
+    VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+    VK_PRESENT_MODE_FIFO_KHR,
+    VK_PRESENT_MODE_IMMEDIATE_KHR,
+#else
     VK_PRESENT_MODE_FIFO_KHR,         // vsync; optimal
     VK_PRESENT_MODE_MAILBOX_KHR,      // vsync; wait until vsync
     VK_PRESENT_MODE_FIFO_RELAXED_KHR, // vsync; optimal, but tearing
     VK_PRESENT_MODE_IMMEDIATE_KHR,    // no vsync
+#endif
     };
 
   for(auto mode:modes){
@@ -489,20 +497,31 @@ VkResult VSwapchain::implAcquireNextImage() {
   auto     dev  = device.device.impl;
   auto&    slot = sync[frameId];
 
+  auto tA0 = Application::tickCount();
   vkWaitForFences(dev, 1, &aquireFence[frameId], VK_TRUE, std::numeric_limits<uint64_t>::max());
+  auto tWaitAcq = Application::tickCount() - tA0;
   vkResetFences(dev, 1, &aquireFence[frameId]);
 
   // We need to wait for any command-buffer that may reference aquireSem[] in the past
+  auto tP0 = Application::tickCount();
   vkWaitForFences(dev, 1, &presentFence[frameId], VK_TRUE, std::numeric_limits<uint64_t>::max());
+  auto tWaitPres = Application::tickCount() - tP0;
   vkResetFences(dev, 1, &presentFence[frameId]);
 
   uint32_t id   = uint32_t(-1);
+  auto tAcq0 = Application::tickCount();
   VkResult code = vkAcquireNextImageDBG(device.device.impl,
                                         swapChain,
                                         std::numeric_limits<uint64_t>::max(),
                                         aquireSem[frameId],
                                         aquireFence[frameId],
                                         &id);
+  auto tAcq = Application::tickCount() - tAcq0;
+
+  static uint32_t s_acqCnt = 0;
+  if(++s_acqCnt % 10 == 0) {
+    Log::i("[SWAP_PERF] waitAcq=", tWaitAcq, " waitPres=", tWaitPres, " acqImg=", tAcq);
+  }
 
   if(code==VK_ERROR_OUT_OF_DATE_KHR) {
     auto rc = vkxRevertFence(device.device.impl, &aquireFence[frameId]);
@@ -574,14 +593,10 @@ void VSwapchain::present() {
     throw SwapchainSuboptimal();
 #endif
   tx = Application::tickCount()-tx;
-  if(tx > 2) {
-    // std::chrono::system_clock::time_point p = std::chrono::system_clock::now();
-    // time_t t = std::chrono::system_clock::to_time_t(p);
-    // char str[26] = {};
-    // strftime(str, sizeof(str), "%H:%M.%S", localtime(&t));
-    // Log::i(str," : vkQueuePresentKHR[",imgIndex,"] = ", tx);
-    }
-  //Log::i("vkQueuePresentKHR[",imgIndex,"] = ", tx);
+  static uint32_t s_presCnt = 0;
+  if(++s_presCnt % 10 == 0) {
+    Log::i("[SWAP_PERF] presQ=", tx);
+  }
   Detail::vkAssert(code);
 
   acquireNextImage();

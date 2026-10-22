@@ -664,7 +664,11 @@ void VDevice::deviceProps(VkInstance instance, const bool hasDeviceFeatures2, Vk
   props.push.maxRange     = size_t(devP.limits.maxPushConstantsSize);
 
   props.anisotropy        = supportedFeatures.samplerAnisotropy;
+#if defined(__ANDROID__)
+  props.maxAnisotropy     = std::min(devP.limits.maxSamplerAnisotropy, 2.0f);
+#else
   props.maxAnisotropy     = devP.limits.maxSamplerAnisotropy;
+#endif
   props.tesselationShader = supportedFeatures.tessellationShader;
   props.geometryShader    = supportedFeatures.geometryShader;
   if(props.vendorID==0x5143) {

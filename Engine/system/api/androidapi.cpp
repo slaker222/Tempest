@@ -191,6 +191,7 @@ void AndroidApi::implProcessEvents(AppCallBack& /*cb*/) {
     Event::KeyType k = Event::K_NoKey;
     switch(ke.keyCode) {
       case 4:   k = Event::K_ESCAPE; break; // KEYCODE_BACK
+      case 111: k = Event::K_ESCAPE; break; // KEYCODE_ESCAPE
       case 19:  k = Event::K_Up;     break; // KEYCODE_DPAD_UP
       case 20:  k = Event::K_Down;   break; // KEYCODE_DPAD_DOWN
       case 21:  k = Event::K_Left;   break; // KEYCODE_DPAD_LEFT
