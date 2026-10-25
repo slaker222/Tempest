@@ -112,10 +112,26 @@ static EM_BOOL onEmscriptenMouseUp(int, const EmscriptenMouseEvent* e, void* use
   return EM_TRUE;
 }
 
+static bool isPointerLocked() {
+  EmscriptenPointerlockChangeEvent st = {};
+  return emscripten_get_pointerlock_status(&st)==EMSCRIPTEN_RESULT_SUCCESS && st.isActive;
+  }
+
 static EM_BOOL onEmscriptenMouseMove(int, const EmscriptenMouseEvent* e, void* userData) {
   auto* w = static_cast<SystemApi::Window*>(userData);
   if(!w || !w->owner) return EM_FALSE;
-  MouseEvent evt(int(e->targetX), int(e->targetY), Event::ButtonNone, Event::M_NoModifier, 0, 0, Event::MouseMove);
+  // under pointer lock the cursor position freezes: move a virtual cursor by
+  // the reported motion instead, so consumers keep seeing position deltas
+  static int vx = 0, vy = 0;
+  if(isPointerLocked()) {
+    vx += int(e->movementX);
+    vy += int(e->movementY);
+    } else {
+    vx = int(e->targetX);
+    vy = int(e->targetY);
+    }
+  const int x = vx, y = vy;
+  MouseEvent evt(x, y, Event::ButtonNone, Event::M_NoModifier, 0, 0, Event::MouseMove);
   WebApi::dispatchMouseMove(*w->owner, evt);
   return EM_TRUE;
 }
@@ -221,7 +237,8 @@ bool WebApi::implSetAsFullscreen(SystemApi::Window* w, bool fullScreen) {
   }
 
 bool WebApi::implIsFullscreen(SystemApi::Window* w) {
-  return w ? w->fullscreen : false;
+  // pointer lock enables mouse-look like a fullscreen window does natively
+  return w ? (w->fullscreen || isPointerLocked()) : false;
   }
 
 float WebApi::implUiScale(SystemApi::Window*) {
