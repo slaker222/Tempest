@@ -686,7 +686,7 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
     uint32_t variant = uint32_t(-1), colorCnt = 0, depth = 0, stride = 0;
     WGPUTextureFormat color[MaxFramebufferAttachments] = {};
     WGPUShaderModule vm = nullptr, fm = nullptr;
-    std::string key;
+    const Inst* hit = nullptr;
     } last;
 
   WGPURenderPipeline instance(uint32_t variant, const WGPUTextureFormat* color, size_t colorCnt,
@@ -694,10 +694,8 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
     const auto vm = vs->module(), fm = fs ? fs->module() : nullptr;
     if(last.variant==variant && last.colorCnt==colorCnt && last.depth==uint32_t(depth) &&
        last.stride==stride && last.vm==vm && last.fm==fm &&
-       std::equal(color, color+colorCnt, last.color)) {
-      auto it = inst.find(last.key);
-      if(it!=inst.end())
-        return *it->second.bad ? nullptr : it->second.p;
+       std::equal(color, color+colorCnt, last.color) && last.hit!=nullptr) {
+      return *last.hit->bad ? nullptr : last.hit->p;
       }
     std::string key;
     key.reserve(32);
@@ -714,10 +712,12 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
     last.vm       = vm;
     last.fm       = fm;
     std::copy(color, color+colorCnt, last.color);
-    last.key      = key;
+    last.hit      = nullptr;
     auto it = inst.find(key);
-    if(it!=inst.end())
+    if(it!=inst.end()) {
+      last.hit = &it->second;
       return *it->second.bad ? nullptr : it->second.p;
+      }
 
     auto layouts = lay.get(variant);
 
@@ -803,7 +803,9 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
     scopeBegin();
     auto p = wgpuDeviceCreateRenderPipeline(g.dev, &d);
     scopeEnd("pipeline " + vs->name + " / " + (fs ? fs->name : std::string("-")), bad);
-    inst[key] = Inst{p, bad};
+    auto& slot = inst[key];
+    slot     = Inst{p, bad};
+    last.hit = &slot;
     return p;
     }
   };
@@ -976,12 +978,17 @@ WGPURenderPipeline blitPipeline(WGPUTextureFormat fmt) {
 // ----------------------------------------------------------- bind groups
 
 struct KeyHash {
+  static uint64_t mix(uint64_t x) {
+    // splitmix64 finalizer: full avalanche, keeps buckets collision-free
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+    }
   size_t operator()(const std::vector<uint64_t>& k) const {
-    uint64_t h = 1469598103934665603ull;
-    for(auto v:k) {
-      h ^= v;
-      h *= 1099511628211ull;
-      }
+    uint64_t h = k.size();
+    for(auto v:k)
+      h = mix(h ^ v);
     return size_t(h ^ (h>>32));
     }
   };
@@ -1093,6 +1100,9 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     bind = Detail::Bindings();
     bindDirty = true;
     pushDirty = true;
+    bgLast    = nullptr;
+    bgLay     = nullptr;
+    varLay    = nullptr;
     resetEncoderState();
     }
 
@@ -1247,6 +1257,10 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
 
   void setBinding(size_t id, AbstractGraphicsApi::Texture* tex, uint32_t mipLevel,
                   const ComponentMapping& m, const Sampler& smp) override {
+    // the engine re-sets every binding per draw: only real changes count
+    if(bind.data[id]==tex && bind.offset[id]==mipLevel && bind.smp[id]==smp &&
+       bind.map[id]==m && (bind.array & (1u<<id))==0)
+      return;
     bind.data  [id] = tex;
     bind.smp   [id] = smp;
     bind.map   [id] = m;
@@ -1256,6 +1270,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     }
 
   void setBinding(size_t id, AbstractGraphicsApi::Buffer* buf, size_t offset) override {
+    if(bind.data[id]==buf && bind.offset[id]==uint32_t(offset) && (bind.array & (1u<<id))==0)
+      return;
     bind.data  [id] = buf;
     bind.offset[id] = uint32_t(offset);
     bind.array &= ~(1u<<id);
@@ -1263,6 +1279,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     }
 
   void setBinding(size_t id, AbstractGraphicsApi::DescArray* arr) override {
+    if(bind.data[id]==arr && (bind.array & (1u<<id))!=0)
+      return;
     bind.data[id] = arr;
     bind.array |= (1u<<id);
     bindDirty = true;
@@ -1271,6 +1289,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   void setBinding(size_t, AbstractGraphicsApi::AccelerationStructure*) override {}
 
   void setBinding(size_t id, const Sampler& smp) override {
+    if(bind.smp[id]==smp)
+      return;
     bind.smp[id] = smp;
     bindDirty = true;
     }
@@ -1351,6 +1371,17 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   WGPUBuffer                      bgPush    = nullptr;
   WGPUBindGroup                   bgLast    = nullptr;
   uint32_t                        bgEpoch   = 0;
+  // layout variant cache: recomputed only when bindings or pipeline change
+  const Layout*                   varLay    = nullptr;
+  uint32_t                        varCached = 0;
+
+  uint32_t variantFor(const Layout& lay) {
+    if(bindDirty || varLay!=&lay) {
+      varCached = variantOf(lay);
+      varLay    = &lay;
+      }
+    return varCached;
+    }
 
   WGPUBindGroup cachedBindGroup(Layout& lay, uint32_t variant, WGPUBindGroupLayout bgl, const std::string& tag) {
     if(!bindDirty && bgLay==&lay && bgVariant==variant && bgPush==pushBufCur && bgLast!=nullptr &&
@@ -1399,7 +1430,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
           x.buffer = b->impl;
           x.offset = off;
           x.size   = sz;
-          key.push_back(b->uid); key.push_back(off);
+          key.push_back(b->uid | (off<<32));
           e.push_back(x);
           break;
           }
@@ -1412,7 +1443,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
             }
           uint32_t mip = bind.offset[i];
           x.textureView = t->view(mip, lay.res[i].dim);
-          key.push_back(t->uid); key.push_back(uint64_t(mip) | uint64_t(lay.res[i].dim)<<32);
+          key.push_back(t->uid | (uint64_t(mip & 0xFFFF)<<32) | (uint64_t(lay.res[i].dim)<<48));
           e.push_back(x);
           if(cls==ShaderReflection::Texture) {
             const bool unfilt = (variant & (1u<<i))!=0 || lay.res[i].sampleType!=WGPUTextureSampleType_Float;
@@ -1439,7 +1470,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
             }
           uint32_t mip = bind.offset[i]==uint32_t(-1) ? 0 : bind.offset[i];
           x.textureView = t->view(mip, lay.res[i].dim);
-          key.push_back(t->uid); key.push_back(uint64_t(mip) | uint64_t(lay.res[i].dim)<<32);
+          key.push_back(t->uid | (uint64_t(mip & 0xFFFF)<<32) | (uint64_t(lay.res[i].dim)<<48));
           e.push_back(x);
           break;
           }
@@ -1470,9 +1501,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     d.layout     = bgl;
     d.entryCount = e.size();
     d.entries    = e.data();
-    scopeBegin();
+    (void)tag;
     auto bg = wgpuDeviceCreateBindGroup(g.dev, &d);
-    scopeEnd("bindgroup " + tag);
     g_bindGroups[key] = bg;
     return bg;
     }
@@ -1490,7 +1520,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       reportFirstUse("draw " + gp->vs->name + " / " + (gp->fs ? gp->fs->name : std::string("-")));
       }
     auto& lay     = gp->lay;
-    const uint32_t variant = variantOf(lay);
+    const uint32_t variant = variantFor(lay);
     auto layouts  = lay.get(variant);
     auto pso      = gp->instance(variant, passColor, passColorCnt, passDepth, stride);
     if(pso==nullptr)
@@ -1521,7 +1551,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       reportFirstUse("dispatch " + cpso->cs->name);
       }
     auto& lay    = cpso->lay;
-    const uint32_t variant = variantOf(lay);
+    const uint32_t variant = variantFor(lay);
     auto layouts = lay.get(variant);
     auto pso     = cpso->instance(variant);
     if(pso==nullptr)
