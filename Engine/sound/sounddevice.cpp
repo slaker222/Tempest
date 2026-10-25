@@ -254,7 +254,7 @@ void* SoundDevice::context() {
   return data->context;
   }
 
-#else
+#elif !defined(__EMSCRIPTEN__)
 
 #include "sounddevice.h"
 #include <Tempest/SoundEffect>

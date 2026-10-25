@@ -236,7 +236,7 @@ float SoundEffect::volume() const {
   return val;
   }
 
-#else
+#elif !defined(__EMSCRIPTEN__)
 
 #include "soundeffect.h"
 

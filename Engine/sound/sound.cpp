@@ -1,4 +1,4 @@
-#if defined(TEMPEST_BUILD_AUDIO)
+#if defined(TEMPEST_BUILD_AUDIO) || defined(__EMSCRIPTEN__)
 
 #include "sound.h"
 #include "sounddevice.h"
@@ -12,9 +12,19 @@
 #include <cstring>
 #include <algorithm>
 
+#if defined(TEMPEST_BUILD_AUDIO)
 #include <AL/alc.h>
 #include <AL/al.h>
 #include <AL/alext.h>
+#else
+// PCM layout tags shared with the Web Audio backend (same values as OpenAL)
+#define AL_FORMAT_MONO8    0x1100
+#define AL_FORMAT_MONO16   0x1101
+#define AL_FORMAT_STEREO8  0x1102
+#define AL_FORMAT_STEREO16 0x1103
+typedef int ALint;
+namespace Tempest { namespace Detail { void webAudioReleaseSound(const void* data); } }
+#endif
 
 using namespace Tempest;
 
@@ -87,7 +97,13 @@ const int32_t Sound::indexTable[] = {
   -1, -1, -1, -1, 2, 4, 6, 8
   };
 
+#if defined(TEMPEST_BUILD_AUDIO)
 Sound::Data::~Data() {}
+#else
+Sound::Data::~Data() {
+  Detail::webAudioReleaseSound(this);
+  }
+#endif
 
 uint64_t Sound::Data::timeLength() const {
   ALint size=0, fr=0, bits=0, channels=0;
