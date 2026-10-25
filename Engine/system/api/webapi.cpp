@@ -258,10 +258,14 @@ static void mainLoopIteration() {
   // An exception escaping this callback kills the requestAnimationFrame
   // chain and the engine dies silently (page keeps running, canvas stays
   // black). Log and keep the loop alive instead.
+  static int iter = 0;
+  ++iter;
+  EM_ASM({ window.__ml = Array.of($0, 1); }, iter);
   try {
     if(s_appCallback != nullptr) {
       s_appCallback->onTimer();
       }
+    EM_ASM({ window.__ml[1] = 2; });
 
     if(s_currentWindow != nullptr && s_currentWindow->owner != nullptr) {
       double cssW = 0, cssH = 0;
@@ -291,7 +295,9 @@ static void mainLoopIteration() {
           }
         }
 
+      EM_ASM({ window.__ml[1] = 3; });
       WebApi::dispatchRender(*s_currentWindow->owner);
+      EM_ASM({ window.__ml[1] = 4; });
       }
     }
   catch(const std::exception& e) {
@@ -305,7 +311,9 @@ static void mainLoopIteration() {
 int WebApi::implExec(AppCallBack& cb) {
   s_appCallback = &cb;
   s_isRunning   = true;
-  emscripten_set_main_loop(mainLoopIteration, 0, 1);
+  // no simulated infinite loop: unwinding main() through wasm frames would
+  // run destructors of the engine state; main() returns instead
+  emscripten_set_main_loop(mainLoopIteration, 0, 0);
   return 0;
   }
 

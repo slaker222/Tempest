@@ -673,6 +673,7 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
   Detail::DSharedPtr<const WShader*> vsRef, fsRef;
   Layout       lay;
   bool         ok = false;
+  bool         reported = false;
   std::vector<Decl::ComponentType> decl;
   struct Inst { WGPURenderPipeline p = nullptr; std::shared_ptr<bool> bad; };
   std::unordered_map<std::string, Inst> inst;
@@ -680,8 +681,24 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
   IVec3  workGroupSize() const override { return IVec3(1,1,1); }
   size_t sizeofBuffer(size_t id, size_t arraylen) const override { return lay.lx.sizeofBuffer(id, arraylen); }
 
+  // last lookup memo: avoids building the string key on every draw
+  struct Last {
+    uint32_t variant = uint32_t(-1), colorCnt = 0, depth = 0, stride = 0;
+    WGPUTextureFormat color[MaxFramebufferAttachments] = {};
+    WGPUShaderModule vm = nullptr, fm = nullptr;
+    std::string key;
+    } last;
+
   WGPURenderPipeline instance(uint32_t variant, const WGPUTextureFormat* color, size_t colorCnt,
                               WGPUTextureFormat depth, size_t stride) {
+    const auto vm = vs->module(), fm = fs ? fs->module() : nullptr;
+    if(last.variant==variant && last.colorCnt==colorCnt && last.depth==uint32_t(depth) &&
+       last.stride==stride && last.vm==vm && last.fm==fm &&
+       std::equal(color, color+colorCnt, last.color)) {
+      auto it = inst.find(last.key);
+      if(it!=inst.end())
+        return *it->second.bad ? nullptr : it->second.p;
+      }
     std::string key;
     key.reserve(32);
     auto put = [&](uint32_t v){ key.append(reinterpret_cast<const char*>(&v), 4); };
@@ -690,6 +707,14 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
     put(uint32_t(reinterpret_cast<uintptr_t>(fs ? fs->module() : nullptr)));
     for(size_t i=0; i<colorCnt; ++i)
       put(uint32_t(color[i]));
+    last.variant  = variant;
+    last.colorCnt = uint32_t(colorCnt);
+    last.depth    = uint32_t(depth);
+    last.stride   = uint32_t(stride);
+    last.vm       = vm;
+    last.fm       = fm;
+    std::copy(color, color+colorCnt, last.color);
+    last.key      = key;
     auto it = inst.find(key);
     if(it!=inst.end())
       return *it->second.bad ? nullptr : it->second.p;
@@ -785,6 +810,7 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
 
 struct WCompPipeline : AbstractGraphicsApi::CompPipeline {
   WShader* cs = nullptr;
+  bool     reported = false;
   Detail::DSharedPtr<const WShader*> csRef;
   Layout   lay;
   IVec3    wg;
@@ -960,6 +986,7 @@ struct KeyHash {
     }
   };
 std::unordered_map<std::vector<uint64_t>, WGPUBindGroup, KeyHash> g_bindGroups;
+uint32_t g_bindGroupEpoch = 0;
 
 void reportFirstUse(const std::string& tag) {
   static std::unordered_map<std::string, bool> seen;
@@ -1316,10 +1343,34 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     return pushOffset;
     }
 
+  std::vector<uint64_t>           bgKey;
+  std::vector<WGPUBindGroupEntry> bgEnt;
+  // bind group reuse while bindings stay untouched
+  const Layout*                   bgLay     = nullptr;
+  uint32_t                        bgVariant = 0;
+  WGPUBuffer                      bgPush    = nullptr;
+  WGPUBindGroup                   bgLast    = nullptr;
+  uint32_t                        bgEpoch   = 0;
+
+  WGPUBindGroup cachedBindGroup(Layout& lay, uint32_t variant, WGPUBindGroupLayout bgl, const std::string& tag) {
+    if(!bindDirty && bgLay==&lay && bgVariant==variant && bgPush==pushBufCur && bgLast!=nullptr &&
+       bgEpoch==g_bindGroupEpoch)
+      return bgLast;
+    auto bg   = bindGroup(lay, variant, bgl, tag);
+    bgEpoch   = g_bindGroupEpoch;
+    bgLay     = &lay;
+    bgVariant = variant;
+    bgPush    = pushBufCur;
+    bgLast    = bg;
+    bindDirty = false;
+    return bg;
+    }
+
   WGPUBindGroup bindGroup(Layout& lay, uint32_t variant, WGPUBindGroupLayout bgl, const std::string& tag) {
-    std::vector<uint64_t>           key;
-    std::vector<WGPUBindGroupEntry> e;
-    key.reserve(64);
+    auto& key = bgKey;
+    auto& e   = bgEnt;
+    key.clear();
+    e.clear();
     key.push_back(reinterpret_cast<uintptr_t>(bgl));
     const bool sepNonFilt = variant!=0;
 
@@ -1413,6 +1464,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       for(auto& i:g_bindGroups)
         wgpuBindGroupRelease(i.second);
       g_bindGroups.clear();
+      g_bindGroupEpoch++;
       }
     WGPUBindGroupDescriptor d = {};
     d.layout     = bgl;
@@ -1421,7 +1473,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     scopeBegin();
     auto bg = wgpuDeviceCreateBindGroup(g.dev, &d);
     scopeEnd("bindgroup " + tag);
-    g_bindGroups[std::move(key)] = bg;
+    g_bindGroups[key] = bg;
     return bg;
     }
 
@@ -1433,7 +1485,10 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       ++g.st.skipped;
       return false;
       }
-    reportFirstUse("draw " + gp->vs->name + " / " + (gp->fs ? gp->fs->name : std::string("-")));
+    if(!gp->reported) {
+      gp->reported = true;
+      reportFirstUse("draw " + gp->vs->name + " / " + (gp->fs ? gp->fs->name : std::string("-")));
+      }
     auto& lay     = gp->lay;
     const uint32_t variant = variantOf(lay);
     auto layouts  = lay.get(variant);
@@ -1445,7 +1500,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       lastPso = pso;
       }
     const uint32_t off = pushOffsetFor(lay);
-    auto bg = bindGroup(lay, variant, layouts.first, gp->vs->name);
+    auto bg = cachedBindGroup(lay, variant, layouts.first, gp->vs->name);
     if(bg==nullptr)
       return false;
     if(bg!=lastBg || (lay.pb.size>0 && off!=lastPushOff)) {
@@ -1461,7 +1516,10 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     if(cpso==nullptr || cpso->cs==nullptr || cpso->cs->module()==nullptr || cpso->cs->pending())
       return false;
     ensureCompute();
-    reportFirstUse("dispatch " + cpso->cs->name);
+    if(!cpso->reported) {
+      cpso->reported = true;
+      reportFirstUse("dispatch " + cpso->cs->name);
+      }
     auto& lay    = cpso->lay;
     const uint32_t variant = variantOf(lay);
     auto layouts = lay.get(variant);
@@ -1473,7 +1531,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       lastPso = pso;
       }
     const uint32_t off = pushOffsetFor(lay);
-    auto bg = bindGroup(lay, variant, layouts.first, cpso->cs->name);
+    auto bg = cachedBindGroup(lay, variant, layouts.first, cpso->cs->name);
     if(bg==nullptr)
       return false;
     if(bg!=lastBg || (lay.pb.size>0 && off!=lastPushOff)) {
