@@ -89,14 +89,17 @@ void scopeBegin() {
   wgpuDevicePushErrorScope(g.dev, WGPUErrorFilter_Validation);
   }
 
-void scopeEnd(std::string what) {
-  auto* tag = new std::string(std::move(what));
+void scopeEnd(std::string what, std::shared_ptr<bool> bad = nullptr) {
+  struct Tag { std::string what; std::shared_ptr<bool> bad; };
+  auto* tag = new Tag{std::move(what), std::move(bad)};
   wgpuDevicePopErrorScope(g.dev, [](WGPUErrorType type, const char* msg, void* user) {
-    auto* tag = static_cast<std::string*>(user);
+    auto* tag = static_cast<Tag*>(user);
     if(type!=WGPUErrorType_NoError) {
+      if(tag->bad)
+        *tag->bad = true;
       ++g.errors;
       if(g.errors<200)
-        Log::e("[WebGPU] ", *tag, ": ", msg ? msg : "");
+        Log::e("[WebGPU] ", tag->what, ": ", msg ? msg : "");
       }
     delete tag;
     }, tag);
@@ -262,7 +265,8 @@ struct WBuffer : AbstractGraphicsApi::Buffer {
   WBuffer(const void* mem, size_t sz, BufferHeap heap) {
     uid   = g.uid++;
     size  = sz;
-    alloc = std::max<uint64_t>(16, alignUp(uint64_t(sz), uint64_t(4)));
+    // WGSL rounds uniform struct sizes up to 16: bindings must cover that tail
+    alloc = std::max<uint64_t>(16, alignUp(uint64_t(sz), uint64_t(16)));
     WGPUBufferDescriptor d = {};
     d.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_Index | WGPUBufferUsage_Uniform |
               WGPUBufferUsage_Storage | WGPUBufferUsage_Indirect |
@@ -411,35 +415,78 @@ WGPUTextureFormat storageFormat(spv::ImageFormat f) {
     }
   }
 
+struct ModuleState {
+  WGPUShaderModule module  = nullptr;
+  std::string      alt;
+  std::string      name;
+  bool             pending = false; // waiting for compilation info
+  bool             bad     = false; // failed to compile: pipelines are skipped
+  };
+
+// Module creation is validated asynchronously: on errors the module switches
+// to the alternative WGSL variant (if any), otherwise it is marked bad and
+// pipelines using it are skipped. Until then the module is pending.
+void createModule(const std::shared_ptr<ModuleState>& state, const std::string& code) {
+  WGPUShaderModuleWGSLDescriptor wd = {};
+  wd.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
+  wd.code        = code.c_str();
+  WGPUShaderModuleDescriptor md = {};
+  md.nextInChain = &wd.chain;
+  md.label       = state->name.c_str();
+  state->pending = true;
+  wgpuDevicePushErrorScope(g.dev, WGPUErrorFilter_Validation);
+  state->module  = wgpuDeviceCreateShaderModule(g.dev, &md);
+  auto* hold = new std::shared_ptr<ModuleState>(state);
+  wgpuDevicePopErrorScope(g.dev, [](WGPUErrorType type, const char* msg, void* user) {
+    auto* hold = static_cast<std::shared_ptr<ModuleState>*>(user);
+    auto  st   = *hold;
+    delete hold;
+    if(type==WGPUErrorType_NoError || st->module==nullptr) {
+      st->pending = false;
+      return;
+      }
+    if(!st->alt.empty()) {
+      std::string alt = std::move(st->alt);
+      st->alt.clear();
+      wgpuShaderModuleRelease(st->module);
+      createModule(st, alt);
+      return;
+      }
+    std::string m = msg ? msg : "";
+    if(m.size()>600)
+      m.resize(600);
+    Log::e("[WebGPU] shader ", st->name, ": ", m);
+    st->bad     = true;
+    st->pending = false;
+    }, hold);
+  }
+
 struct WShader : Detail::Shader {
-  WGPUShaderModule module = nullptr;
+  std::shared_ptr<ModuleState> state = std::make_shared<ModuleState>();
   std::string      name;
   ResInfo          res[MaxBindings];
   uint32_t         fragOutputs = 0; // bitmask of fragment output locations
   bool             fragUintOut[MaxFramebufferAttachments] = {};
 
-  WShader(const uint32_t* spirv, size_t words, const char* wgsl, size_t wgslLen, std::string nm)
+  WShader(const uint32_t* spirv, size_t words, std::string wgsl, std::string alt, std::string nm)
     : Detail::Shader(spirv, words*4) {
     name = nm.empty() ? std::string(dbgShortName()) : std::move(nm);
     reflect(spirv, words);
-    if(wgsl!=nullptr && wgslLen>0) {
-      std::string code(wgsl, wgslLen);
-      WGPUShaderModuleWGSLDescriptor wd = {};
-      wd.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
-      wd.code        = code.c_str();
-      WGPUShaderModuleDescriptor md = {};
-      md.nextInChain = &wd.chain;
-      md.label       = name.c_str();
-      scopeBegin();
-      module = wgpuDeviceCreateShaderModule(g.dev, &md);
-      scopeEnd("shader " + name);
-      }
+    if(wgsl.empty())
+      return;
+    state->name = name;
+    state->alt  = std::move(alt);
+    createModule(state, wgsl);
     }
 
   ~WShader() override {
-    if(module!=nullptr)
-      wgpuShaderModuleRelease(module);
+    if(state->module!=nullptr)
+      wgpuShaderModuleRelease(state->module);
+    state->module = nullptr;
     }
+
+  WGPUShaderModule module()  const { return state->bad ? nullptr : state->module; }
+  bool             pending() const { return state->pending; }
 
   void reflect(const uint32_t* spirv, size_t words) {
     spirv_cross::Compiler comp(spirv, words);
@@ -627,7 +674,8 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
   Layout       lay;
   bool         ok = false;
   std::vector<Decl::ComponentType> decl;
-  std::unordered_map<std::string, WGPURenderPipeline> inst;
+  struct Inst { WGPURenderPipeline p = nullptr; std::shared_ptr<bool> bad; };
+  std::unordered_map<std::string, Inst> inst;
 
   IVec3  workGroupSize() const override { return IVec3(1,1,1); }
   size_t sizeofBuffer(size_t id, size_t arraylen) const override { return lay.lx.sizeofBuffer(id, arraylen); }
@@ -638,11 +686,13 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
     key.reserve(32);
     auto put = [&](uint32_t v){ key.append(reinterpret_cast<const char*>(&v), 4); };
     put(variant); put(uint32_t(depth)); put(uint32_t(stride)); put(uint32_t(colorCnt));
+    put(uint32_t(reinterpret_cast<uintptr_t>(vs->module())));
+    put(uint32_t(reinterpret_cast<uintptr_t>(fs ? fs->module() : nullptr)));
     for(size_t i=0; i<colorCnt; ++i)
       put(uint32_t(color[i]));
     auto it = inst.find(key);
     if(it!=inst.end())
-      return it->second;
+      return *it->second.bad ? nullptr : it->second.p;
 
     auto layouts = lay.get(variant);
 
@@ -663,7 +713,7 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
     WGPURenderPipelineDescriptor d = {};
     d.label  = vs->name.c_str();
     d.layout = layouts.second;
-    d.vertex.module      = vs->module;
+    d.vertex.module      = vs->module();
     d.vertex.entryPoint  = "main";
     d.vertex.bufferCount = decl.empty() ? 0 : 1;
     d.vertex.buffers     = &vbl;
@@ -708,7 +758,7 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
 
     WGPUColorTargetState ct[MaxFramebufferAttachments] = {};
     WGPUFragmentState    fst = {};
-    if(fs!=nullptr && fs->module!=nullptr) {
+    if(fs!=nullptr && fs->module()!=nullptr) {
       for(size_t i=0; i<colorCnt; ++i) {
         ct[i].format    = color[i];
         const bool has  = (fs->fragOutputs & (1u<<i))!=0;
@@ -717,17 +767,18 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
         ct[i].blend     = (st.hasBlend() && !ints) ? &blend : nullptr;
         ct[i].writeMask = (has && !st.isRasterDiscardEnabled()) ? WGPUColorWriteMask_All : WGPUColorWriteMask_None;
         }
-      fst.module      = fs->module;
+      fst.module      = fs->module();
       fst.entryPoint  = "main";
       fst.targetCount = colorCnt;
       fst.targets     = ct;
       d.fragment      = &fst;
       }
 
+    auto bad = std::make_shared<bool>(false);
     scopeBegin();
     auto p = wgpuDeviceCreateRenderPipeline(g.dev, &d);
-    scopeEnd("pipeline " + vs->name + " / " + (fs ? fs->name : std::string("-")));
-    inst[key] = p;
+    scopeEnd("pipeline " + vs->name + " / " + (fs ? fs->name : std::string("-")), bad);
+    inst[key] = Inst{p, bad};
     return p;
     }
   };
@@ -737,25 +788,28 @@ struct WCompPipeline : AbstractGraphicsApi::CompPipeline {
   Detail::DSharedPtr<const WShader*> csRef;
   Layout   lay;
   IVec3    wg;
-  std::unordered_map<uint32_t, WGPUComputePipeline> inst;
+  struct Inst { WGPUComputePipeline p = nullptr; std::shared_ptr<bool> bad; };
+  std::unordered_map<uint64_t, Inst> inst;
 
   IVec3  workGroupSize() const override { return wg; }
   size_t sizeofBuffer(size_t id, size_t arraylen) const override { return lay.lx.sizeofBuffer(id, arraylen); }
 
   WGPUComputePipeline instance(uint32_t variant) {
-    auto it = inst.find(variant);
+    const uint64_t key = uint64_t(variant) | (uint64_t(reinterpret_cast<uintptr_t>(cs->module()))<<32);
+    auto it = inst.find(key);
     if(it!=inst.end())
-      return it->second;
+      return *it->second.bad ? nullptr : it->second.p;
     auto layouts = lay.get(variant);
     WGPUComputePipelineDescriptor d = {};
     d.label              = cs->name.c_str();
     d.layout             = layouts.second;
-    d.compute.module     = cs->module;
+    d.compute.module     = cs->module();
     d.compute.entryPoint = "main";
+    auto bad = std::make_shared<bool>(false);
     scopeBegin();
     auto p = wgpuDeviceCreateComputePipeline(g.dev, &d);
-    scopeEnd("compute " + cs->name);
-    inst[variant] = p;
+    scopeEnd("compute " + cs->name, bad);
+    inst[key] = Inst{p, bad};
     return p;
     }
   };
@@ -1373,7 +1427,9 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
 
   bool flushGraphics(size_t stride) {
     ++g.st.draws;
-    if(gp==nullptr || !gp->ok || rp==nullptr) {
+    if(gp==nullptr || !gp->ok || rp==nullptr ||
+       gp->vs->pending() || (gp->fs!=nullptr && gp->fs->pending()) ||
+       gp->vs->module()==nullptr || (gp->fs!=nullptr && gp->fs->module()==nullptr)) {
       ++g.st.skipped;
       return false;
       }
@@ -1402,7 +1458,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
 
   bool flushCompute() {
     ++g.st.dispatches;
-    if(cpso==nullptr || cpso->cs==nullptr || cpso->cs->module==nullptr)
+    if(cpso==nullptr || cpso->cs==nullptr || cpso->cs->module()==nullptr || cpso->cs->pending())
       return false;
     ensureCompute();
     reportFirstUse("dispatch " + cpso->cs->name);
@@ -1410,6 +1466,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     const uint32_t variant = variantOf(lay);
     auto layouts = lay.get(variant);
     auto pso     = cpso->instance(variant);
+    if(pso==nullptr)
+      return false;
     if(lastPso!=pso) {
       wgpuComputePassEncoderSetPipeline(cp, pso);
       lastPso = pso;
@@ -1646,7 +1704,7 @@ AbstractGraphicsApi::PPipeline WebGapi::createPipeline(Device*, const RenderStat
       stages[1] = s;
       }
     }
-  if(p->vs==nullptr || p->vs->module==nullptr || (p->fs!=nullptr && p->fs->module==nullptr)) {
+  if(p->vs==nullptr || p->vs->module()==nullptr || (p->fs!=nullptr && p->fs->module()==nullptr)) {
     Log::e("[WebGPU] unsupported graphics pipeline: ",
            p->vs ? p->vs->name : std::string("<no vs>"), " / ",
            p->fs ? p->fs->name : std::string("<no fs>"));
@@ -1669,7 +1727,7 @@ AbstractGraphicsApi::PCompPipeline WebGapi::createComputePipeline(Device*, Shade
   p->wg    = s->comp.wgSize;
   const WShader* stages[1] = {s};
   p->lay.init(stages, 1);
-  if(s->module==nullptr)
+  if(s->module()==nullptr)
     Log::e("[WebGPU] unsupported compute pipeline: ", s->name);
   return PCompPipeline(p.release());
   }
@@ -1689,17 +1747,22 @@ AbstractGraphicsApi::PShader WebGapi::createShader(Device*, const void* source, 
     at += 4;
     std::string name(reinterpret_cast<const char*>(src+at), nameLen);
     at += nameLen;
-    if(at>size)
+    uint32_t wgslLen = 0;
+    std::memcpy(&wgslLen, src+at, 4);
+    at += 4;
+    if(at+wgslLen>size)
       throw std::system_error(Tempest::GraphicsErrc::InvalidShaderModule);
-    const char* wgsl = reinterpret_cast<const char*>(src+at);
-    return PShader(new WShader(spv.data(), spv.size(), wgsl, size-at, name));
+    std::string wgsl(reinterpret_cast<const char*>(src+at), wgslLen);
+    at += wgslLen;
+    std::string alt(reinterpret_cast<const char*>(src+at), size-at);
+    return PShader(new WShader(spv.data(), spv.size(), std::move(wgsl), std::move(alt), std::move(name)));
     }
   // untranslatable module: reflection only, pipelines using it are skipped
   if(size%4!=0)
     throw std::system_error(Tempest::GraphicsErrc::InvalidShaderModule);
   std::vector<uint32_t> spv(size/4);
   std::memcpy(spv.data(), src, size);
-  return PShader(new WShader(spv.data(), spv.size(), nullptr, 0, std::string()));
+  return PShader(new WShader(spv.data(), spv.size(), std::string(), std::string(), std::string()));
   }
 
 AbstractGraphicsApi::DescArray* WebGapi::createDescriptors(Device*, AbstractGraphicsApi::Texture**, size_t, uint32_t, const Sampler&) {
