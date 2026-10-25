@@ -203,6 +203,7 @@ void VDevice::createLogicalDevice(VkPhysicalDevice pdev) {
 
   deviceFeatures.vertexPipelineStoresAndAtomics = supportedFeatures.vertexPipelineStoresAndAtomics;
   deviceFeatures.fragmentStoresAndAtomics       = supportedFeatures.fragmentStoresAndAtomics;
+  deviceFeatures.multiDrawIndirect              = supportedFeatures.multiDrawIndirect;
 
   VkDeviceCreateInfo createInfo = {};
   createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;

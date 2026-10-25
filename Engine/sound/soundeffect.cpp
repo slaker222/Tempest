@@ -236,4 +236,42 @@ float SoundEffect::volume() const {
   return val;
   }
 
+#else
+
+#include "soundeffect.h"
+
+using namespace Tempest;
+
+SoundProducer::SoundProducer(uint16_t frequency, uint16_t channels)
+  : frequency(frequency), channels(channels) {}
+
+struct SoundEffect::Impl {};
+
+SoundEffect::SoundEffect() = default;
+SoundEffect::SoundEffect(SoundEffect&&) = default;
+SoundEffect::~SoundEffect() = default;
+SoundEffect& SoundEffect::operator=(SoundEffect&&) = default;
+
+void     SoundEffect::play() {}
+void     SoundEffect::pause() {}
+
+bool     SoundEffect::isEmpty() const { return true; }
+bool     SoundEffect::isFinished() const { return true; }
+uint64_t SoundEffect::timeLength() const { return 0; }
+uint64_t SoundEffect::currentTime() const { return 0; }
+
+void     SoundEffect::setPosition(const Tempest::Vec3&) {}
+void     SoundEffect::setPosition(float, float, float) {}
+void     SoundEffect::setMaxDistance(float) {}
+void     SoundEffect::setVolume(float) {}
+float    SoundEffect::volume() const { return 0; }
+
+Tempest::Vec3 SoundEffect::position() const { return {}; }
+float    SoundEffect::x() const { return 0; }
+float    SoundEffect::y() const { return 0; }
+float    SoundEffect::z() const { return 0; }
+
+SoundEffect::SoundEffect(SoundDevice&, const Sound&) {}
+SoundEffect::SoundEffect(SoundDevice&, std::unique_ptr<SoundProducer>&&) {}
+
 #endif

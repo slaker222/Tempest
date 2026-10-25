@@ -1,3 +1,5 @@
+#if defined(__ANDROID__)
+
 #include "androidapi.h"
 
 #include <Tempest/Window>
@@ -17,8 +19,9 @@ std::mutex                AndroidApi::windowSync;
 std::condition_variable   AndroidApi::windowCv;
 
 std::mutex                AndroidApi::eventSync;
-std::vector<AndroidApi::TouchEvent>   AndroidApi::touchEvents;
-std::vector<AndroidApi::KeyEventData> AndroidApi::keyEvents;
+std::vector<AndroidApi::TouchEvent>     AndroidApi::touchEvents;
+std::vector<AndroidApi::KeyEventData>   AndroidApi::keyEvents;
+std::vector<AndroidApi::MouseEventData> AndroidApi::mouseEvents;
 
 float                     AndroidApi::touchStartX     = 0.0f;
 float                     AndroidApi::touchStartY     = 0.0f;
@@ -83,6 +86,11 @@ void AndroidApi::pushTouchEvent(int action, float x, float y, int id) {
 void AndroidApi::pushKeyEvent(int action, int keyCode) {
   std::lock_guard<std::mutex> lk(eventSync);
   keyEvents.push_back({action, keyCode});
+  }
+
+void AndroidApi::pushMouseEvent(int action, int button, int x, int y) {
+  std::lock_guard<std::mutex> lk(eventSync);
+  mouseEvents.push_back({action, button, x, y});
   }
 
 SystemApi::Window* AndroidApi::implCreateWindow(Tempest::Window* owner, uint32_t /*width*/, uint32_t /*height*/) {
@@ -175,16 +183,30 @@ int AndroidApi::implExec(AppCallBack& cb) {
   }
 
 void AndroidApi::implProcessEvents(AppCallBack& /*cb*/) {
-  std::vector<TouchEvent>   tEvents;
-  std::vector<KeyEventData> kEvents;
+  std::vector<TouchEvent>     tEvents;
+  std::vector<KeyEventData>   kEvents;
+  std::vector<MouseEventData> mEvents;
   {
     std::lock_guard<std::mutex> lk(eventSync);
     tEvents.swap(touchEvents);
     kEvents.swap(keyEvents);
+    mEvents.swap(mouseEvents);
     }
 
   if(currentOwner == nullptr)
     return;
+
+  // Mouse events handling
+  for(const auto& me : mEvents) {
+    Event::MouseButton mb = (me.button == 1) ? Event::ButtonLeft : (me.button == 2 ? Event::ButtonRight : Event::ButtonNone);
+    if(me.action == 0) {
+      MouseEvent md(me.x, me.y, mb, Event::M_NoModifier, 0, 0, Event::MouseDown);
+      SystemApi::dispatchMouseDown(*currentOwner, md);
+      } else {
+      MouseEvent mu(me.x, me.y, mb, Event::M_NoModifier, 0, 0, Event::MouseUp);
+      SystemApi::dispatchMouseUp(*currentOwner, mu);
+      }
+    }
 
   // Key events handling
   for(const auto& ke : kEvents) {
@@ -245,3 +267,5 @@ void AndroidApi::implProcessEvents(AppCallBack& /*cb*/) {
 
 void AndroidApi::implSetWindowTitle(SystemApi::Window* /*w*/, const char* /*utf8*/) {
   }
+
+#endif

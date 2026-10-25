@@ -1,4 +1,5 @@
 #pragma once
+#if defined(__ANDROID__)
 
 #include <Tempest/SystemApi>
 #include <atomic>
@@ -33,6 +34,13 @@ class AndroidApi final: public SystemApi {
       int keyCode;
       };
 
+    struct MouseEventData {
+      int action;
+      int button;
+      int x;
+      int y;
+      };
+
     using TouchHook = bool (*)(int action, float x, float y, int id);
     static void setTouchHook(TouchHook hook);
 
@@ -41,6 +49,7 @@ class AndroidApi final: public SystemApi {
     static void  notifySurfaceChanged(int width, int height);
     static void  pushTouchEvent(int action, float x, float y, int id);
     static void  pushKeyEvent(int action, int keyCode);
+    static void  pushMouseEvent(int action, int button, int x, int y);
 
   private:
     AndroidApi();
@@ -70,9 +79,10 @@ class AndroidApi final: public SystemApi {
     static std::mutex                windowSync;
     static std::condition_variable   windowCv;
 
-    static std::mutex                eventSync;
-    static std::vector<TouchEvent>   touchEvents;
-    static std::vector<KeyEventData> keyEvents;
+    static std::mutex                  eventSync;
+    static std::vector<TouchEvent>     touchEvents;
+    static std::vector<KeyEventData>   keyEvents;
+    static std::vector<MouseEventData> mouseEvents;
 
     static float                     touchStartX;
     static float                     touchStartY;
@@ -84,3 +94,5 @@ class AndroidApi final: public SystemApi {
   };
 
 }
+
+#endif

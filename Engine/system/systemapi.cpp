@@ -1,5 +1,7 @@
 #if defined(__ANDROID__)
 #include "api/androidapi.h"
+#elif defined(__EMSCRIPTEN__)
+#include "api/webapi.h"
 #elif defined(__WINDOWS__)
 #include "api/windowsapi.h"
 #elif defined(__UNIX__)
@@ -105,6 +107,8 @@ SystemApi& SystemApi::inst() {
   static WindowsApi api;
 #elif defined(__ANDROID__)
   static AndroidApi api;
+#elif defined(__EMSCRIPTEN__)
+  static WebApi api;
 #elif defined(__UNIX__)
   static X11Api api;
 #elif defined(__OSX__)

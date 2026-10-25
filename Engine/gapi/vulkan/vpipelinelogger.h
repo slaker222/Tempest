@@ -8,6 +8,7 @@ extern "C" {
 
 // Debug Configuration API
 void opengothic_debug_init();
+void opengothic_debug_check_reload();
 int  opengothic_debug_no_bindless();
 int  opengothic_debug_no_dynrendering();
 int  opengothic_debug_no_multidraw();
@@ -20,6 +21,12 @@ int  opengothic_debug_skip_atest();
 int  opengothic_debug_spirv_noopt();
 int  opengothic_debug_no_atest_depth();
 int  opengothic_debug_prewarm();
+int  opengothic_debug_render_scale();
+int  opengothic_debug_simple_render();
+int  opengothic_debug_freeze_time();
+// 1 = use full-scene HiZ depth prepass (desktop default); Android default 0 (prepass costs more than occlusion saves on Adreno)
+int  opengothic_debug_use_hiz_prepass();
+int  opengothic_debug_force_hiz();
 
 // Prewarm Checkpoint API
 int  opengothic_prewarm_check_crashed(const char* key);

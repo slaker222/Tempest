@@ -7,7 +7,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
-#include <vector>
+#include <chrono>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -34,10 +34,19 @@ struct Config {
   int skip_gbuf       = 0;
   int skip_atest      = 0;
   int spirv_noopt     = 0;
+#if defined(__ANDROID__)
+  // solid-depth variants for alpha-test in shadow/depth passes: no discard FS, LRZ-friendly on Adreno
+  int no_atest_depth  = 1;
+#else
   int no_atest_depth  = 0;
+#endif
+  int force_hiz       = 0;
   int prewarm         = 0;
   int log_pipelines   = 1;
   int safe_mode       = 0;
+  int render_scale    = 100;
+  int simple_render   = 0;
+  int freeze_time     = 0; // hour 1..24 to pin time-of-day for stable benchmarking; 0 = off
   bool loaded         = false;
 };
 
@@ -96,9 +105,84 @@ static void logBoth(const char* msg) {
 
 extern "C" {
 
+static time_t s_lastCfgMtime = 0;
+static std::chrono::steady_clock::time_point s_lastCfgCheck{};
+
+static void parseConfigFile(const char* cfgPath, time_t mtime) {
+  FILE* f = fopen(cfgPath, "r");
+  if(!f) return;
+  s_lastCfgMtime = mtime;
+
+  char line[256];
+  while(fgets(line, sizeof(line), f)) {
+    if(line[0] == '#' || line[0] == ';' || line[0] == '/' || line[0] == '\n' || line[0] == '\r')
+      continue;
+    char key[128] = {0};
+    int val = 0;
+    if(sscanf(line, "%127[^=]=%d", key, &val) == 2) {
+      char* k = key;
+      while(*k == ' ' || *k == '\t') k++;
+      int len = strlen(k);
+      while(len > 0 && (k[len-1] == ' ' || k[len-1] == '\t' || k[len-1] == '\r' || k[len-1] == '\n')) {
+        k[len-1] = '\0';
+        len--;
+      }
+
+      if(strcmp(k, "no_bindless") == 0) s_config.no_bindless = val;
+      else if(strcmp(k, "no_dynrendering") == 0) s_config.no_dynrendering = val;
+      else if(strcmp(k, "no_multidraw") == 0) s_config.no_multidraw = val;
+      else if(strcmp(k, "skip_hiz") == 0) s_config.skip_hiz = val;
+      else if(strcmp(k, "skip_shadows") == 0) s_config.skip_shadows = val;
+      else if(strcmp(k, "skip_lights") == 0) s_config.skip_lights = val;
+      else if(strcmp(k, "skip_fog") == 0) s_config.skip_fog = val;
+      else if(strcmp(k, "skip_gbuf") == 0) s_config.skip_gbuf = val;
+      else if(strcmp(k, "skip_atest") == 0) s_config.skip_atest = val;
+      else if(strcmp(k, "no_atest_depth") == 0) s_config.no_atest_depth = val;
+      else if(strcmp(k, "prewarm") == 0) s_config.prewarm = val;
+      else if(strcmp(k, "spirv_noopt") == 0) s_config.spirv_noopt = val;
+      else if(strcmp(k, "log_pipelines") == 0) s_config.log_pipelines = val;
+      else if(strcmp(k, "safe_mode") == 0) s_config.safe_mode = val;
+      else if(strcmp(k, "render_scale") == 0) s_config.render_scale = val;
+      else if(strcmp(k, "simple_render") == 0) s_config.simple_render = val;
+      else if(strcmp(k, "freeze_time") == 0) s_config.freeze_time = val;
+      else if(strcmp(k, "force_hiz") == 0) s_config.force_hiz = val;
+    }
+  }
+  fclose(f);
+
+  if(s_config.safe_mode) {
+    s_config.no_bindless     = 1;
+    s_config.no_multidraw    = 1;
+    s_config.skip_hiz        = 1;
+    s_config.no_atest_depth  = 1;
+  }
+}
+
+void opengothic_debug_check_reload() {
+  std::lock_guard<std::mutex> lock(s_logMutex);
+  auto now = std::chrono::steady_clock::now();
+  if(std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastCfgCheck).count() < 300)
+    return;
+  s_lastCfgCheck = now;
+
+  const char* dir = findGameDir();
+  char cfgPath[512];
+  snprintf(cfgPath, sizeof(cfgPath), "%s/debug.cfg", dir);
+  struct stat st;
+  if(stat(cfgPath, &st) == 0) {
+    if(st.st_mtime != s_lastCfgMtime) {
+      parseConfigFile(cfgPath, st.st_mtime);
+      LOGI("debug.cfg reloaded: render_scale=%d, simple_render=%d", s_config.render_scale, s_config.simple_render);
+    }
+  }
+}
+
 void opengothic_debug_init() {
   std::lock_guard<std::mutex> lock(s_logMutex);
-  if(s_config.loaded) return;
+  if(s_config.loaded) {
+    opengothic_debug_check_reload();
+    return;
+  }
   s_config.loaded = true;
 
   const char* dir = findGameDir();
@@ -107,8 +191,10 @@ void opengothic_debug_init() {
   char cfgPath[512];
   snprintf(cfgPath, sizeof(cfgPath), "%s/debug.cfg", dir);
 
-  FILE* f = fopen(cfgPath, "r");
-  if(!f) {
+  struct stat st;
+  if(stat(cfgPath, &st) == 0) {
+    parseConfigFile(cfgPath, st.st_mtime);
+  } else {
     // Create template debug.cfg for user convenience
     FILE* out = fopen(cfgPath, "w");
     if(out) {
@@ -124,50 +210,14 @@ void opengothic_debug_init() {
       fputs("prewarm=0\n", out);
       fputs("spirv_noopt=0\n", out);
       fputs("log_pipelines=1\n", out);
+      fputs("render_scale=100\n", out);
+      fputs("simple_render=0\n", out);
       fflush(out);
       fclose(out);
     }
-  } else {
-    char line[256];
-    while(fgets(line, sizeof(line), f)) {
-      if(line[0] == '#' || line[0] == ';' || line[0] == '/' || line[0] == '\n' || line[0] == '\r')
-        continue;
-      char key[128] = {0};
-      int val = 0;
-      if(sscanf(line, "%127[^=]=%d", key, &val) == 2) {
-        // trim whitespace
-        char* k = key;
-        while(*k == ' ' || *k == '\t') k++;
-        int len = strlen(k);
-        while(len > 0 && (k[len-1] == ' ' || k[len-1] == '\t' || k[len-1] == '\r' || k[len-1] == '\n')) {
-          k[len-1] = '\0';
-          len--;
-        }
-
-        if(strcmp(k, "no_bindless") == 0) s_config.no_bindless = val;
-        else if(strcmp(k, "no_dynrendering") == 0) s_config.no_dynrendering = val;
-        else if(strcmp(k, "no_multidraw") == 0) s_config.no_multidraw = val;
-        else if(strcmp(k, "skip_hiz") == 0) s_config.skip_hiz = val;
-        else if(strcmp(k, "skip_shadows") == 0) s_config.skip_shadows = val;
-        else if(strcmp(k, "skip_lights") == 0) s_config.skip_lights = val;
-        else if(strcmp(k, "skip_fog") == 0) s_config.skip_fog = val;
-        else if(strcmp(k, "skip_gbuf") == 0) s_config.skip_gbuf = val;
-        else if(strcmp(k, "skip_atest") == 0) s_config.skip_atest = val;
-        else if(strcmp(k, "no_atest_depth") == 0) s_config.no_atest_depth = val;
-        else if(strcmp(k, "prewarm") == 0) s_config.prewarm = val;
-        else if(strcmp(k, "spirv_noopt") == 0) s_config.spirv_noopt = val;
-        else if(strcmp(k, "log_pipelines") == 0) s_config.log_pipelines = val;
-        else if(strcmp(k, "safe_mode") == 0) s_config.safe_mode = val;
-      }
+    if(stat(cfgPath, &st) == 0) {
+      parseConfigFile(cfgPath, st.st_mtime);
     }
-    fclose(f);
-  }
-
-  if(s_config.safe_mode) {
-    s_config.no_bindless     = 1;
-    s_config.no_multidraw    = 1;
-    s_config.skip_hiz        = 1;
-    s_config.no_atest_depth  = 1;
   }
 
   // Prewarm crash detection from previous run
@@ -234,6 +284,17 @@ int  opengothic_debug_prewarm()         { if(!s_config.loaded) opengothic_debug_
 int  opengothic_debug_spirv_noopt()     { if(!s_config.loaded) opengothic_debug_init(); return s_config.spirv_noopt; }
 int  opengothic_debug_log_pipelines()   { if(!s_config.loaded) opengothic_debug_init(); return s_config.log_pipelines; }
 int  opengothic_debug_safe_mode()       { if(!s_config.loaded) opengothic_debug_init(); return s_config.safe_mode; }
+int  opengothic_debug_freeze_time()     { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.freeze_time; }
+int  opengothic_debug_force_hiz()       { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.force_hiz; }
+int  opengothic_debug_use_hiz_prepass() {
+#if defined(__ANDROID__)
+  return opengothic_debug_force_hiz();
+#else
+  return 1;
+#endif
+  }
+int  opengothic_debug_render_scale()    { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.render_scale; }
+int  opengothic_debug_simple_render()   { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.simple_render; }
 
 int opengothic_prewarm_check_crashed(const char* key) {
   const char* dir = findGameDir();

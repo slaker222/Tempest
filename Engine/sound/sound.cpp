@@ -311,4 +311,19 @@ int Sound::decodeAdPcmBlock(int16_t *outbuf, const uint8_t *inbuf, size_t inbufs
   return samples;
   }
 
+#else
+
+#include "sound.h"
+
+using namespace Tempest;
+
+Sound::Sound(const char*) {}
+Sound::Sound(const std::string&) {}
+Sound::Sound(const char16_t*) {}
+Sound::Sound(const std::u16string&) {}
+Sound::Sound(IDevice&) {}
+
+bool Sound::isEmpty() const { return true; }
+uint64_t Sound::timeLength() const { return 0; }
+
 #endif

@@ -26,6 +26,7 @@ class CommandBuffer final {
     CommandBuffer& operator = (CommandBuffer&& other)=default;
 
     auto startEncoding(Tempest::Device& dev) -> Encoder<CommandBuffer>;
+    void collectGpuTimers();
 
   private:
     CommandBuffer(Tempest::Device& dev, AbstractGraphicsApi::CommandBuffer* impl);

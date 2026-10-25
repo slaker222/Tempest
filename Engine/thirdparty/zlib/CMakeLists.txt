@@ -149,14 +149,16 @@ if(MINGW)
     set(ZLIB_DLL_SRCS ${CMAKE_CURRENT_BINARY_DIR}/zlib1rc.obj)
 endif(MINGW)
 
+if(NOT EMSCRIPTEN)
 add_library(zlib SHARED ${ZLIB_SRCS} ${ZLIB_DLL_SRCS} ${ZLIB_PUBLIC_HDRS} ${ZLIB_PRIVATE_HDRS})
 target_include_directories(zlib PUBLIC ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-add_library(zlibstatic STATIC ${ZLIB_SRCS} ${ZLIB_PUBLIC_HDRS} ${ZLIB_PRIVATE_HDRS})
-target_include_directories(zlibstatic PUBLIC ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(zlib PROPERTIES DEFINE_SYMBOL ZLIB_DLL)
 set_target_properties(zlib PROPERTIES SOVERSION 1)
+endif()
+add_library(zlibstatic STATIC ${ZLIB_SRCS} ${ZLIB_PUBLIC_HDRS} ${ZLIB_PRIVATE_HDRS})
+target_include_directories(zlibstatic PUBLIC ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 
-if(NOT CYGWIN)
+if(NOT EMSCRIPTEN AND NOT CYGWIN)
     # This property causes shared libraries on Linux to have the full version
     # encoded into their final filename.  We disable this on Cygwin because
     # it causes cygz-${ZLIB_FULL_VERSION}.dll to be created when cygz.dll
@@ -169,9 +171,13 @@ endif()
 
 if(UNIX)
     # On unix-like platforms the library is almost always called libz
-   set_target_properties(zlib zlibstatic PROPERTIES OUTPUT_NAME z)
-   if(NOT APPLE AND NOT(CMAKE_SYSTEM_NAME STREQUAL AIX))
-     set_target_properties(zlib PROPERTIES LINK_FLAGS "-Wl,--version-script,\"${CMAKE_CURRENT_SOURCE_DIR}/zlib.map\"")
+   if(NOT EMSCRIPTEN)
+     set_target_properties(zlib zlibstatic PROPERTIES OUTPUT_NAME z)
+     if(NOT APPLE AND NOT(CMAKE_SYSTEM_NAME STREQUAL AIX))
+       set_target_properties(zlib PROPERTIES LINK_FLAGS "-Wl,--version-script,\"${CMAKE_CURRENT_SOURCE_DIR}/zlib.map\"")
+     endif()
+   else()
+     set_target_properties(zlibstatic PROPERTIES OUTPUT_NAME z)
    endif()
 elseif(BUILD_SHARED_LIBS AND WIN32)
     # Creates zlib1.dll when building shared library version
@@ -179,10 +185,15 @@ elseif(BUILD_SHARED_LIBS AND WIN32)
 endif()
 
 if(NOT SKIP_INSTALL_LIBRARIES AND NOT SKIP_INSTALL_ALL )
-    install(TARGETS zlib zlibstatic
-        RUNTIME DESTINATION "${INSTALL_BIN_DIR}"
-        ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
-        LIBRARY DESTINATION "${INSTALL_LIB_DIR}" )
+    if(NOT EMSCRIPTEN)
+      install(TARGETS zlib zlibstatic
+          RUNTIME DESTINATION "${INSTALL_BIN_DIR}"
+          ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
+          LIBRARY DESTINATION "${INSTALL_LIB_DIR}" )
+    else()
+      install(TARGETS zlibstatic
+          ARCHIVE DESTINATION "${INSTALL_LIB_DIR}" )
+    endif()
 endif()
 if(NOT SKIP_INSTALL_HEADERS AND NOT SKIP_INSTALL_ALL )
     install(FILES ${ZLIB_PUBLIC_HDRS} DESTINATION "${INSTALL_INC_DIR}")

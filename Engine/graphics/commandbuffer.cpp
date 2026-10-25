@@ -24,3 +24,6 @@ Encoder<CommandBuffer> CommandBuffer::startEncoding(Device& device) {
     }
   return Encoder<CommandBuffer>(this);
   }
+
+void CommandBuffer::collectGpuTimers() {
+  }

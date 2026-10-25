@@ -27,7 +27,11 @@ enum class LogLevel {
   Warning,
   Trace
   };
+#if defined(__EMSCRIPTEN__)
+LogLevel gLogLevel = LogLevel::Error;
+#else
 extern LogLevel gLogLevel; // HACK: openal spams too much
+#endif
 
 struct SoundDevice::Data {
   std::shared_ptr<Device> dev;
@@ -249,5 +253,38 @@ void SoundDevice::setGlobalVolume(float v) {
 void* SoundDevice::context() {
   return data->context;
   }
+
+#else
+
+#include "sounddevice.h"
+#include <Tempest/SoundEffect>
+
+using namespace Tempest;
+
+struct SoundDevice::Data {};
+
+SoundDevice::SoundDevice() {}
+SoundDevice::SoundDevice(std::string_view) {}
+SoundDevice::~SoundDevice() {}
+
+std::vector<SoundDevice::Props> SoundDevice::devices() { return {}; }
+
+SoundEffect SoundDevice::load(const char*) { return SoundEffect(); }
+SoundEffect SoundDevice::load(Tempest::IDevice&) { return SoundEffect(); }
+SoundEffect SoundDevice::load(const Sound&) { return SoundEffect(); }
+SoundEffect SoundDevice::load(std::unique_ptr<SoundProducer>&&) { return SoundEffect(); }
+
+void SoundDevice::process() {}
+void SoundDevice::suspend() {}
+
+void SoundDevice::setListenerPosition(const Tempest::Vec3&) {}
+void SoundDevice::setListenerPosition(float, float, float) {}
+
+void SoundDevice::setListenerDirection(const Tempest::Vec3&, const Tempest::Vec3&) {}
+void SoundDevice::setListenerDirection(float, float, float, float, float, float) {}
+
+void SoundDevice::setGlobalVolume(float) {}
+
+void* SoundDevice::context() { return nullptr; }
 
 #endif
