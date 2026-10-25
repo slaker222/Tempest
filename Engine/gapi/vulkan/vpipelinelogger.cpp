@@ -24,10 +24,18 @@
 
 namespace {
 struct Config {
+#if defined(__EMSCRIPTEN__)
+  // WebGPU: no binding arrays, no image atomics (Hi-Z mip chain needs them)
+  int no_bindless     = 1;
+  int no_dynrendering = 0;
+  int no_multidraw    = 1;
+  int skip_hiz        = 1;
+#else
   int no_bindless     = 0;
   int no_dynrendering = 0;
   int no_multidraw    = 0;
   int skip_hiz        = 0;
+#endif
   int skip_shadows    = 0;
   int skip_lights     = 0;
   int skip_fog        = 0;
@@ -287,7 +295,7 @@ int  opengothic_debug_safe_mode()       { if(!s_config.loaded) opengothic_debug_
 int  opengothic_debug_freeze_time()     { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.freeze_time; }
 int  opengothic_debug_force_hiz()       { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.force_hiz; }
 int  opengothic_debug_use_hiz_prepass() {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
   return opengothic_debug_force_hiz();
 #else
   return 1;

@@ -243,6 +243,15 @@ if(NOT GLSLANGVALIDATOR)
   message(FATAL_ERROR "glslangValidator required")
 endif()
 
+if(EMSCRIPTEN)
+  set(TEMPEST_SPV_WEB "${CMAKE_SOURCE_DIR}/scripts/spv_web.py" CACHE FILEPATH "SPIR-V to WebGPU blob converter")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  find_program(TEMPEST_NAGA naga PATHS "$ENV{HOME}/.cargo/bin")
+  if(NOT TEMPEST_NAGA)
+    message(FATAL_ERROR "naga (cargo install naga-cli) is required for the web build")
+  endif()
+endif()
+
 function(add_shader OUTPUT SOURCE)
   set(OUTPUT_FILE "${PROJECT_BINARY_DIR}/sprv/${OUTPUT}")
   set(SOURCE_FILE "${PROJECT_SOURCE_DIR}/shaders/${SOURCE}")
@@ -250,12 +259,24 @@ function(add_shader OUTPUT SOURCE)
   set(SHADERS_SPRV ${SHADERS_SPRV} ${OUTPUT_FILE} PARENT_SCOPE)
 
   list(SUBLIST ARGV 2 -1 VARS)
-  add_custom_command(
-    OUTPUT     ${OUTPUT_FILE}
-    DEPENDS    ${SOURCE_FILE}
-    COMMAND    ${CMAKE_COMMAND} -E make_directory "${PROJECT_BINARY_DIR}/sprv/"
-    COMMAND    ${GLSLANGVALIDATOR} -V ${VARS} "${SOURCE_FILE}" -o ${OUTPUT_FILE}
-    )
+  if(EMSCRIPTEN)
+    # WebGPU backend consumes SPIR-V + WGSL blobs (see TEMPEST_SPV_WEB)
+    add_custom_command(
+      OUTPUT     ${OUTPUT_FILE}
+      DEPENDS    ${SOURCE_FILE} ${TEMPEST_SPV_WEB}
+      COMMAND    ${CMAKE_COMMAND} -E make_directory "${PROJECT_BINARY_DIR}/sprv/"
+      COMMAND    ${GLSLANGVALIDATOR} -V ${VARS} "${SOURCE_FILE}" -o "${OUTPUT_FILE}.spv"
+      COMMAND    ${Python3_EXECUTABLE} ${TEMPEST_SPV_WEB} "${OUTPUT_FILE}.spv" "${OUTPUT_FILE}" ${TEMPEST_NAGA}
+      COMMAND    ${CMAKE_COMMAND} -E remove "${OUTPUT_FILE}.spv"
+      )
+  else()
+    add_custom_command(
+      OUTPUT     ${OUTPUT_FILE}
+      DEPENDS    ${SOURCE_FILE}
+      COMMAND    ${CMAKE_COMMAND} -E make_directory "${PROJECT_BINARY_DIR}/sprv/"
+      COMMAND    ${GLSLANGVALIDATOR} -V ${VARS} "${SOURCE_FILE}" -o ${OUTPUT_FILE}
+      )
+  endif()
 endfunction(add_shader)
 
 add_shader(blit.vert.sprv      blit.vert "")
