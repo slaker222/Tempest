@@ -104,6 +104,14 @@ Dialog::~Dialog() {
   }
 
 int Dialog::exec() {
+  show();
+  while(owner_ov && Application::isRunning()) {
+    Application::processEvents();
+    }
+  return 0;
+  }
+
+void Dialog::show() {
   if(owner_ov==nullptr){
     owner_ov = new Overlay(*this);
 
@@ -114,10 +122,6 @@ int Dialog::exec() {
 
   setVisible(true);
   showEvent();
-  while(owner_ov && Application::isRunning()) {
-    Application::processEvents();
-    }
-  return 0;
   }
 
 void Dialog::close() {

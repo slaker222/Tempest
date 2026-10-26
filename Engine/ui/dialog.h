@@ -12,6 +12,7 @@ class Dialog : public Panel {
     ~Dialog() override;
 
     int  exec();
+    void show(); // non-blocking: the dialog is closed with close()
     void close();
 
     bool isOpen() const;
