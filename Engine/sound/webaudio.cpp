@@ -14,9 +14,14 @@
 
 #include <emscripten.h>
 #include <emscripten/eventloop.h>
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -224,6 +229,29 @@ EM_JS(void, oga_listener, (int what, float a, float b, float c, float d, float e
 
 namespace {
 
+// The AudioContext and the tables below live on the main thread; sounds are
+// also started and moved from worker threads (npc animation runs in parallel),
+// those calls run synchronously on the main thread.
+template<class F>
+auto onMain(F&& f) -> decltype(f()) {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+  if(!emscripten_is_main_runtime_thread()) {
+    using R = decltype(f());
+    if constexpr(std::is_void_v<R>) {
+      auto call = [](void* p) { (*static_cast<F*>(p))(); };
+      emscripten_proxy_sync(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(), call, &f);
+      return;
+      } else {
+      struct Ctx { F& f; R r; } ctx{f, R()};
+      auto call = [](void* p) { auto& c = *static_cast<Ctx*>(p); c.r = c.f(); };
+      emscripten_proxy_sync(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(), call, &ctx);
+      return ctx.r;
+      }
+    }
+#endif
+  return f();
+  }
+
 std::unordered_map<const void*, int> g_buffers; // Sound::Data -> AudioBuffer id
 
 struct Stream {
@@ -243,11 +271,13 @@ void pumpAll(void*) {
 namespace Tempest {
 namespace Detail {
 void webAudioReleaseSound(const void* data) {
-  auto it = g_buffers.find(data);
-  if(it==g_buffers.end())
-    return;
-  oga_buffer_free(it->second);
-  g_buffers.erase(it);
+  onMain([data]() {
+    auto it = g_buffers.find(data);
+    if(it==g_buffers.end())
+      return;
+    oga_buffer_free(it->second);
+    g_buffers.erase(it);
+    });
   }
 }
 }
@@ -296,23 +326,23 @@ void SoundDevice::process() {}
 void SoundDevice::suspend() {}
 
 void SoundDevice::setListenerPosition(const Vec3& p) {
-  oga_listener(0, p.x, p.y, p.z, 0, 0, 0);
+  onMain([&]() { oga_listener(0, p.x, p.y, p.z, 0, 0, 0); });
   }
 
 void SoundDevice::setListenerPosition(float x, float y, float z) {
-  oga_listener(0, x, y, z, 0, 0, 0);
+  onMain([&]() { oga_listener(0, x, y, z, 0, 0, 0); });
   }
 
 void SoundDevice::setListenerDirection(const Vec3& f, const Vec3& up) {
-  oga_listener(1, f.x, f.y, f.z, up.x, up.y, up.z);
+  onMain([&]() { oga_listener(1, f.x, f.y, f.z, up.x, up.y, up.z); });
   }
 
 void SoundDevice::setListenerDirection(float dx, float dy, float dz, float ux, float uy, float uz) {
-  oga_listener(1, dx, dy, dz, ux, uy, uz);
+  onMain([&]() { oga_listener(1, dx, dy, dz, ux, uy, uz); });
   }
 
 void SoundDevice::setGlobalVolume(float v) {
-  oga_listener(2, v, 0, 0, 0, 0, 0);
+  onMain([&]() { oga_listener(2, v, 0, 0, 0, 0, 0); });
   }
 
 void* SoundDevice::context() {
@@ -338,6 +368,10 @@ struct SoundEffect::Impl : Stream {
   Impl(const Sound& s) : data(s.data) {
     if(data==nullptr)
       return;
+    onMain([this]() { init(); });
+    }
+
+  void init() {
     int buf = 0;
     auto it = g_buffers.find(data.get());
     if(it!=g_buffers.end()) {
@@ -355,12 +389,18 @@ struct SoundEffect::Impl : Stream {
     }
 
   Impl(std::unique_ptr<SoundProducer>&& p) : producer(std::move(p)) {
-    src = oga_source(0, producer->channels, producer->frequency);
-    if(src!=0)
-      g_streams.push_back(this);
+    onMain([this]() {
+      src = oga_source(0, producer->channels, producer->frequency);
+      if(src!=0)
+        g_streams.push_back(this);
+      });
     }
 
   ~Impl() override {
+    onMain([this]() { release(); });
+    }
+
+  void release() {
     if(producer!=nullptr) {
       auto it = std::find(g_streams.begin(), g_streams.end(), static_cast<Stream*>(this));
       if(it!=g_streams.end())
@@ -400,12 +440,12 @@ SoundEffect& SoundEffect::operator=(SoundEffect&& s) {
 
 void SoundEffect::play() {
   if(impl && impl->src!=0)
-    oga_play(impl->src);
+    onMain([this]() { oga_play(impl->src); });
   }
 
 void SoundEffect::pause() {
   if(impl && impl->src!=0)
-    oga_pause(impl->src);
+    onMain([this]() { oga_pause(impl->src); });
   }
 
 bool SoundEffect::isEmpty() const {
@@ -415,7 +455,7 @@ bool SoundEffect::isEmpty() const {
 bool SoundEffect::isFinished() const {
   if(impl==nullptr || impl->src==0)
     return true;
-  return oga_state(impl->src)==0;
+  return onMain([this]() { return oga_state(impl->src); })==0;
   }
 
 uint64_t SoundEffect::timeLength() const {
@@ -427,7 +467,7 @@ uint64_t SoundEffect::timeLength() const {
 uint64_t SoundEffect::currentTime() const {
   if(impl==nullptr || impl->src==0)
     return 0;
-  return uint64_t(oga_time(impl->src)*1000.0);
+  return uint64_t(onMain([this]() { return oga_time(impl->src); })*1000.0);
   }
 
 void SoundEffect::setPosition(const Vec3& p) {
@@ -436,13 +476,13 @@ void SoundEffect::setPosition(const Vec3& p) {
 
 void SoundEffect::setPosition(float x, float y, float z) {
   if(impl && impl->src!=0)
-    oga_set(impl->src, 0, x, y, z);
+    onMain([&]() { oga_set(impl->src, 0, x, y, z); });
   }
 
 Vec3 SoundEffect::position() const {
   if(impl==nullptr || impl->src==0)
     return Vec3();
-  return Vec3(oga_get(impl->src, 0), oga_get(impl->src, 1), oga_get(impl->src, 2));
+  return onMain([this]() { return Vec3(oga_get(impl->src, 0), oga_get(impl->src, 1), oga_get(impl->src, 2)); });
   }
 
 float SoundEffect::x() const { return position().x; }
@@ -451,18 +491,18 @@ float SoundEffect::z() const { return position().z; }
 
 void SoundEffect::setMaxDistance(float dist) {
   if(impl && impl->src!=0)
-    oga_set(impl->src, 1, dist, 0, 0);
+    onMain([&]() { oga_set(impl->src, 1, dist, 0, 0); });
   }
 
 void SoundEffect::setVolume(float val) {
   if(impl && impl->src!=0)
-    oga_set(impl->src, 2, val, 0, 0);
+    onMain([&]() { oga_set(impl->src, 2, val, 0, 0); });
   }
 
 float SoundEffect::volume() const {
   if(impl==nullptr || impl->src==0)
     return 0;
-  return oga_get(impl->src, 3);
+  return onMain([this]() { return oga_get(impl->src, 3); });
   }
 
 #endif

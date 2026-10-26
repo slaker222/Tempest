@@ -9,6 +9,9 @@
 
 #include <emscripten.h>
 #include <emscripten/html5.h>
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#include <emscripten/threading.h>
+#endif
 #include <emscripten/html5_webgpu.h>
 #include <webgpu/webgpu.h>
 
@@ -78,6 +81,16 @@ struct Ctx {
   int               dbg   = 0; // window.__OG_GAPI_DEBUG: 2 = magenta clear of screen passes
   };
 Ctx g;
+
+// WebGPU objects exist on the main thread only
+inline void checkThread(const char* what) {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+  if(!emscripten_is_main_runtime_thread())
+    Log::e("[WebGPU] ", what, " called from a worker thread");
+#else
+  (void)what;
+#endif
+  }
 
 void onDeviceError(WGPUErrorType type, const char* msg, void*) {
   ++g.errors;
@@ -274,6 +287,7 @@ struct WBuffer : AbstractGraphicsApi::Buffer {
   std::vector<uint8_t> shadow;     // CPU copy of upload-heap buffers
 
   WBuffer(const void* mem, size_t sz, BufferHeap heap) {
+    checkThread("buffer creation");
     uid   = g.uid++;
     size  = sz;
     // WGSL rounds uniform struct sizes up to 16: bindings must cover that tail
@@ -299,6 +313,7 @@ struct WBuffer : AbstractGraphicsApi::Buffer {
   void update(const void* data, size_t off, size_t sz) override {
     if(data==nullptr || sz==0 || off+sz>size)
       return;
+    checkThread("buffer update");
     if(!shadow.empty())
       std::memcpy(shadow.data()+off, data, sz);
     if(off%4==0 && sz%4==0) {
@@ -340,6 +355,7 @@ struct WTexture : AbstractGraphicsApi::Texture {
   uint32_t mipCount() const override { return mips; }
 
   void create(WGPUTextureUsageFlags usage) {
+    checkThread("texture creation");
     uid = g.uid++;
     WGPUTextureDescriptor td = {};
     td.usage         = usage;
@@ -1157,6 +1173,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   bool isRecording() const override { return recording; }
 
   void begin() override {
+    checkThread("command recording");
     reset();
     WGPUCommandEncoderDescriptor d = {};
     enc       = wgpuDeviceCreateCommandEncoder(g.dev, &d);
