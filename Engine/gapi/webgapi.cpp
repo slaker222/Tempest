@@ -20,6 +20,7 @@
 #include "thirdparty/spirv_cross/spirv_cross.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -1108,6 +1109,40 @@ void reportMissing(const std::string& tag, uint32_t slot) {
 
 // -------------------------------------------------------- command buffer
 
+// growable array of plain values: appends are a bounds check and a copy
+template<class T>
+struct PodBuf {
+  T*     p   = nullptr;
+  size_t n   = 0;
+  size_t cap = 0;
+
+  PodBuf() = default;
+  PodBuf(const PodBuf&) = delete;
+  PodBuf(PodBuf&& o) noexcept { swap(o); }
+  PodBuf& operator=(PodBuf&& o) noexcept { swap(o); return *this; }
+  ~PodBuf() { std::free(p); }
+
+  size_t   size()  const { return n; }
+  bool     empty() const { return n==0; }
+  T*       data()        { return p; }
+  const T* data()  const { return p; }
+  T        operator[](size_t i) const { return p[i]; }
+  void     clear() { n = 0; }
+  void     swap(PodBuf& o) { std::swap(p,o.p); std::swap(n,o.n); std::swap(cap,o.cap); }
+
+  T* grow(size_t k) {
+    if(n+k>cap) {
+      cap = std::max(cap*2, n+k+1024);
+      p   = static_cast<T*>(std::realloc(p, cap*sizeof(T)));
+      }
+    T* r = p+n;
+    n += k;
+    return r;
+    }
+  void append(const T* v, size_t k) { std::memcpy(grow(k), v, k*sizeof(T)); }
+  void assign(const T* v, size_t k) { n = 0; append(v, k); }
+  };
+
 // push data slot allocated by a segment: payload at rawPush[at], len bytes
 struct PushSlot {
   uint32_t chunk = 0, off = 0, sz = 0, len = 0, at = 0;
@@ -1197,7 +1232,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     WGPURenderBundle  bundle = nullptr;
     // how the ops were produced: the engine calls and the state they started from
     SegStart          start;
-    std::vector<uint32_t> raw;
+    PodBuf<uint32_t>      raw;
     std::vector<PushSlot> slots;
     std::vector<size_t>   used; // push chunk fill after the segment, from start.chunk on
     uint32_t          resGen = 0, stateGen = 0;
@@ -1221,8 +1256,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   // invalidates only the piece it is in.
   enum RawCall : uint32_t { R_Pso = 1, R_CPso, R_Push, R_Tex, R_Buf, R_Arr, R_Smp, R_Draw, R_DrawIdx, R_DrawInd };
   static constexpr uint32_t SubSegDraws = 64;
-  std::vector<uint32_t>     raw, rawTmp;
-  std::vector<uint8_t>      rawPush, rawPushTmp;
+  PodBuf<uint32_t>          raw, rawTmp;
+  PodBuf<uint8_t>           rawPush, rawPushTmp;
   size_t                    pushAt   = 0;  // current push data in rawPush
   std::vector<PushSlot>     slots;
   SegStart                  start;
@@ -1230,6 +1265,10 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   bool                      spec      = false;
   bool                      replaying = false;
   bool                      segSkip   = false; // a draw was skipped: result may change once shaders are ready
+
+  void rawPut(std::initializer_list<uint32_t> w) {
+    std::copy(w.begin(), w.end(), raw.grow(w.size()));
+    }
 
   WPipeline*                gp = nullptr;
   WCompPipeline*            cpso = nullptr;
@@ -1246,6 +1285,20 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     WGPUBuffer           buf = nullptr;
     std::vector<uint8_t> cpu;
     size_t               used = 0;
+    // bytes changed since the last upload: slots mostly hold the same data
+    // as in the previous frame, only changed ranges are written to the GPU
+    size_t               dirtyB = PushChunk, dirtyE = 0;
+
+    void write(size_t off, size_t sz, const void* data, size_t len) {
+      static const uint8_t zero[PushAlign*4] = {};
+      uint8_t* dst = cpu.data()+off;
+      if(sz<=sizeof(zero) && std::memcmp(dst, data, len)==0 && std::memcmp(dst+len, zero, sz-len)==0)
+        return;
+      std::memcpy(dst, data, len);
+      std::memset(dst+len, 0, sz-len);
+      dirtyB = std::min(dirtyB, off);
+      dirtyE = std::max(dirtyE, off+sz);
+      }
     };
   std::vector<Chunk>        chunks;
   size_t                    chunkId = 0;
@@ -1342,10 +1395,13 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     }
 
   void submitTo(WGPUQueue q) {
-    for(size_t i=0; i<chunks.size() && i<=chunkId; ++i) {
-      auto& c = chunks[i];
-      if(c.used>0)
-        wgpuQueueWriteBuffer(q, c.buf, 0, c.cpu.data(), alignUp(uint64_t(c.used), uint64_t(4)));
+    for(auto& c:chunks) {
+      if(c.dirtyE<=c.dirtyB)
+        continue;
+      const size_t b = c.dirtyB/4*4, e = size_t(alignUp(uint64_t(c.dirtyE), uint64_t(4)));
+      wgpuQueueWriteBuffer(q, c.buf, b, c.cpu.data()+b, e-b);
+      c.dirtyB = PushChunk;
+      c.dirtyE = 0;
       }
     if(done!=nullptr) {
       ++g.st.submits;
@@ -1457,7 +1513,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   // ------------------------------------------------------------ state
   void setPipeline(AbstractGraphicsApi::Pipeline& p) override {
     if(rp!=nullptr)
-      raw.insert(raw.end(), {R_Pso, uint32_t(uintptr_t(&p))});
+      rawPut({R_Pso, uint32_t(uintptr_t(&p))});
     gp = static_cast<WPipeline*>(&p);
     bindDirty = true;
     pushDirty = true;
@@ -1465,7 +1521,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
 
   void setComputePipeline(AbstractGraphicsApi::CompPipeline& p) override {
     if(rp!=nullptr)
-      raw.insert(raw.end(), {R_CPso, uint32_t(uintptr_t(&p))});
+      rawPut({R_CPso, uint32_t(uintptr_t(&p))});
     cpso = static_cast<WCompPipeline*>(&p);
     bindDirty = true;
     pushDirty = true;
@@ -1474,9 +1530,9 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   void setPushData(const void* data, size_t size) override {
     size = std::min(size, sizeof(push));
     if(rp!=nullptr) {
-      raw.insert(raw.end(), {R_Push, uint32_t(size)});
+      rawPut({R_Push, uint32_t(size)});
       pushAt = rawPush.size();
-      rawPush.insert(rawPush.end(), reinterpret_cast<const uint8_t*>(data), reinterpret_cast<const uint8_t*>(data)+size);
+      rawPush.append(reinterpret_cast<const uint8_t*>(data), size);
       }
     std::memcpy(push, data, size);
     pushSize  = size;
@@ -1490,7 +1546,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
        bind.map[id]==m && (bind.array & (1u<<id))==0)
       return;
     if(rp!=nullptr)
-      raw.insert(raw.end(), {R_Tex, uint32_t(id), uint32_t(uintptr_t(tex)), mipLevel, packSampler(smp), packMapping(m)});
+      rawPut({R_Tex, uint32_t(id), uint32_t(uintptr_t(tex)), mipLevel, packSampler(smp), packMapping(m)});
     bind.data  [id] = tex;
     bind.smp   [id] = smp;
     bind.map   [id] = m;
@@ -1503,7 +1559,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     if(bind.data[id]==buf && bind.offset[id]==uint32_t(offset) && (bind.array & (1u<<id))==0)
       return;
     if(rp!=nullptr)
-      raw.insert(raw.end(), {R_Buf, uint32_t(id), uint32_t(uintptr_t(buf)), uint32_t(offset)});
+      rawPut({R_Buf, uint32_t(id), uint32_t(uintptr_t(buf)), uint32_t(offset)});
     bind.data  [id] = buf;
     bind.offset[id] = uint32_t(offset);
     bind.array &= ~(1u<<id);
@@ -1514,7 +1570,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     if(bind.data[id]==arr && (bind.array & (1u<<id))!=0)
       return;
     if(rp!=nullptr)
-      raw.insert(raw.end(), {R_Arr, uint32_t(id), uint32_t(uintptr_t(arr))});
+      rawPut({R_Arr, uint32_t(id), uint32_t(uintptr_t(arr))});
     bind.data[id] = arr;
     bind.array |= (1u<<id);
     bindDirty = true;
@@ -1526,7 +1582,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     if(bind.smp[id]==smp)
       return;
     if(rp!=nullptr)
-      raw.insert(raw.end(), {R_Smp, uint32_t(id), packSampler(smp)});
+      rawPut({R_Smp, uint32_t(id), packSampler(smp)});
     bind.smp[id] = smp;
     bindDirty = true;
     }
@@ -1592,8 +1648,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
         }
       }
     auto& c = chunks[chunkId];
-    std::memset(c.cpu.data()+c.used, 0, sz);
-    std::memcpy(c.cpu.data()+c.used, push, std::min<size_t>(pushSize, lay.pb.size));
+    c.write(c.used, sz, push, std::min<size_t>(pushSize, lay.pb.size));
     if(rp!=nullptr)
       slots.push_back({uint32_t(chunkId), uint32_t(c.used), uint32_t(sz),
                        uint32_t(std::min<size_t>(pushSize, lay.pb.size)), uint32_t(pushAt)});
@@ -1928,7 +1983,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     pushAt   = 0;
     if(rp==nullptr)
       return;
-    rawPush.assign(push, push+pushSize);
+    rawPush.assign(push, pushSize);
     start.bind     = bind;
     start.gp       = gp;
     std::memcpy(start.push, push, pushSize);
@@ -1946,7 +2001,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
            sg.start==start;
     }
 
-  void runRaw(const std::vector<uint32_t>& r, const std::vector<uint8_t>& payload) {
+  void runRaw(const PodBuf<uint32_t>& r, const PodBuf<uint8_t>& payload) {
     using A = AbstractGraphicsApi;
     size_t pc = start.pushSize;
     replaying = true;
@@ -2015,11 +2070,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
         ++g.st.specHit;
         ++g.st.bundles;
         wgpuRenderPassEncoderExecuteBundles(rp, 1, &sg.bundle);
-        for(auto& sl:sg.slots) {
-          auto* dst = chunks[sl.chunk].cpu.data()+sl.off;
-          std::memset(dst, 0, sl.sz);
-          std::memcpy(dst, rawPush.data()+sl.at, sl.len);
-          }
+        for(auto& sl:sg.slots)
+          chunks[sl.chunk].write(sl.off, sl.sz, rawPush.data()+sl.at, sl.len);
         for(size_t i=0; i<sg.used.size(); ++i)
           chunks[sg.start.chunk+i].used = sg.used[i];
         if(!sg.used.empty())
@@ -2049,7 +2101,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       rawTmp.swap(raw);
       raw.clear();
       rawPushTmp.swap(rawPush);
-      rawPush.assign(push, push+pushSize);
+      rawPush.assign(push, pushSize);
       slots.clear();
       pushAt = 0;
       runRaw(rawTmp, rawPushTmp);
@@ -2113,7 +2165,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     if(vertexCount==0 || instanceCount==0)
       return;
     if(rp!=nullptr)
-      raw.insert(raw.end(), {R_Draw, uint32_t(uintptr_t(vbo)), uint32_t(stride), uint32_t(offset),
+      rawPut({R_Draw, uint32_t(uintptr_t(vbo)), uint32_t(stride), uint32_t(offset),
                              uint32_t(vertexCount), uint32_t(firstInstance), uint32_t(instanceCount)});
     if(!spec)
       implDraw(vbo, stride, offset, vertexCount, firstInstance, instanceCount);
@@ -2126,7 +2178,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     if(isize==0 || instanceCount==0)
       return;
     if(rp!=nullptr)
-      raw.insert(raw.end(), {R_DrawIdx, uint32_t(uintptr_t(vbo)), uint32_t(stride), uint32_t(voffset),
+      rawPut({R_DrawIdx, uint32_t(uintptr_t(vbo)), uint32_t(stride), uint32_t(voffset),
                              uint32_t(uintptr_t(&ibo)), uint32_t(cls), uint32_t(ioffset), uint32_t(isize),
                              uint32_t(firstInstance), uint32_t(instanceCount)});
     if(!spec)
@@ -2136,7 +2188,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
 
   void drawIndirect(const AbstractGraphicsApi::Buffer& indirect, size_t offset) override {
     if(rp!=nullptr)
-      raw.insert(raw.end(), {R_DrawInd, uint32_t(uintptr_t(&indirect)), uint32_t(offset)});
+      rawPut({R_DrawInd, uint32_t(uintptr_t(&indirect)), uint32_t(offset)});
     if(!spec)
       implDrawIndirect(indirect, offset);
     endDraw();
