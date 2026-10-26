@@ -304,8 +304,12 @@ static void mainLoopIteration() {
         int cw = 0, ch = 0;
         if(emscripten_get_canvas_element_size("#canvas", &cw, &ch) == EMSCRIPTEN_RESULT_SUCCESS) {
           const double dpr = emscripten_get_device_pixel_ratio();
-          const int expW = std::max(1, int(curW * dpr + 0.5));
-          const int expH = std::max(1, int(curH * dpr + 0.5));
+          // the same formula as the swapchain (WSwapchain::reset), from the
+          // fractional css size: with the truncated size a phone's dpr turned the
+          // rounding error into a "drift" on every frame, and every frame rebuilt
+          // all render targets (15-20 FPS in landscape)
+          const int expW = std::max(1, int(cssW * dpr + 0.5));
+          const int expH = std::max(1, int(cssH * dpr + 0.5));
           canvasDrift = (std::abs(cw - expW) > 2) || (std::abs(ch - expH) > 2);
           }
 
