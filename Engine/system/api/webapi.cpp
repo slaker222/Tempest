@@ -221,18 +221,12 @@ Rect WebApi::implWindowClientRect(SystemApi::Window* w) {
   }
 
 bool WebApi::implSetAsFullscreen(SystemApi::Window* w, bool fullScreen) {
+  // The page owns fullscreen (its buttons put the whole player, controls
+  // included, fullscreen or into window mode). A request for the bare canvas
+  // is deferred by the browser to the next click and then crops the page
+  // layout: only the flag is kept.
   if(w != nullptr)
     w->fullscreen = fullScreen;
-
-  if(fullScreen) {
-    EmscriptenFullscreenStrategy s{};
-    s.scaleMode = EMSCRIPTEN_FULLSCREEN_SCALE_DEFAULT;
-    s.canvasResolutionScaleMode = EMSCRIPTEN_FULLSCREEN_CANVAS_SCALE_STDDEF;
-    s.filteringMode = EMSCRIPTEN_FULLSCREEN_FILTERING_DEFAULT;
-    emscripten_request_fullscreen_strategy("#canvas", 1, &s);
-    } else {
-    emscripten_exit_fullscreen();
-    }
   return true;
   }
 
