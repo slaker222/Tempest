@@ -148,6 +148,8 @@ EM_JS(void, oga_set, (int id, int what, float x, float y, float z), {
   const A = Module.oga;
   const s = A && A.srcs[id];
   if (!s) return;
+  // Web Audio throws on NaN/Infinity (OpenAL ignores such values): keep the old one
+  if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return;
   const t = A.ctx.currentTime;
   // every setValueAtTime adds an automation event: skip unchanged values
   if (what === 0) {
@@ -214,6 +216,8 @@ EM_JS(void, oga_listener, (int what, float a, float b, float c, float d, float e
   if (!A || !A.ctx) return;
   const L = A.ctx.listener, t = A.ctx.currentTime;
   const k = what === 2 ? [a] : what === 0 ? [a, b, c] : [a, b, c, d, e, f];
+  // Web Audio throws on NaN/Infinity (OpenAL ignores such values): keep the old one
+  if (!k.every(isFinite)) return;
   const last = (A.lst || (A.lst = []))[what];
   if (last && last.length === k.length && last.every((v, i) => v === k[i])) return;
   A.lst[what] = k;
