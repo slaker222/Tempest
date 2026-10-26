@@ -71,6 +71,12 @@ static Event::KeyType mapEmscriptenKey(const char* code) {
   if(std::strcmp(code, "ControlRight") == 0) return Event::K_RControl;
   if(std::strcmp(code, "AltLeft") == 0) return Event::K_LAlt;
   if(std::strcmp(code, "AltRight") == 0) return Event::K_RAlt;
+  if(std::strcmp(code, "Delete") == 0) return Event::K_Delete;
+  if(std::strcmp(code, "Insert") == 0) return Event::K_Insert;
+  if(std::strcmp(code, "Home") == 0) return Event::K_Home;
+  if(std::strcmp(code, "End") == 0) return Event::K_End;
+  if(std::strncmp(code, "Digit", 5) == 0 && code[5]>='0' && code[5]<='9' && code[6]=='\0')
+    return Event::KeyType(Event::K_0 + (code[5]-'0'));
   if(std::strcmp(code, "ArrowUp") == 0) return Event::K_Up;
   if(std::strcmp(code, "ArrowDown") == 0) return Event::K_Down;
   if(std::strcmp(code, "ArrowLeft") == 0) return Event::K_Left;
