@@ -82,7 +82,8 @@ struct Ctx {
 
   struct Stats {
     uint32_t passes = 0, screenPasses = 0, draws = 0, skipped = 0, dispatches = 0, submits = 0;
-    uint32_t bgLookups = 0, bgCreated = 0, bundles = 0, specHit = 0, specMiss = 0, chainHits = 0, chainChecked = 0, chainWrong = 0;
+    uint32_t bgLookups = 0, bgCreated = 0, bundles = 0, specHit = 0, specMiss = 0, chainHits = 0, chainChecked = 0, chainWrong = 0, wbCalls = 0;
+    uint64_t wbBytes = 0;
     } st;
   uint32_t          frame = 0;
   uint32_t          resEpoch = 0; // bumped by every GPU resource creation, see replayBegin
@@ -330,6 +331,7 @@ struct WBuffer : AbstractGraphicsApi::Buffer {
       std::memcpy(shadow.data()+off, data, sz);
     if(off%4==0 && sz%4==0) {
       wgpuQueueWriteBuffer(g.queue, impl, off, data, sz);
+      ++g.st.wbCalls; g.st.wbBytes += sz;
       return;
       }
     // writeBuffer needs 4-byte granularity: widen the range
@@ -2874,7 +2876,7 @@ void WebGapi::present(Device*, Swapchain* sw) {
     Log::i("[WebGPU] frame ", g.frame, ": passes=", g.st.passes, " screen=", g.st.screenPasses,
            " draws=", g.st.draws, " skipped=", g.st.skipped, " dispatch=", g.st.dispatches,
            " submits=", g.st.submits, " bg=", g.st.bgLookups, "/", g.st.bgCreated, " bundles=", g.st.bundles,
-           " spec=", g.st.specHit, "/", g.st.specMiss, " chains=", g.st.chainHits, "/", g.st.chainChecked, "/", g.st.chainWrong, " resGen=", g.resGen, " errors=", g.errors);
+           " spec=", g.st.specHit, "/", g.st.specMiss, " chains=", g.st.chainHits, "/", g.st.chainChecked, "/", g.st.chainWrong, " wb=", g.st.wbCalls, "/", uint32_t(g.st.wbBytes>>10), "K resGen=", g.resGen, " errors=", g.errors);
     }
   g.st = Ctx::Stats();
   g.dbg = EM_ASM_INT({ window.__ogFrame = $0; return (typeof window.__OG_GAPI_DEBUG === 'number') ? window.__OG_GAPI_DEBUG : 0; }, g.frame);
