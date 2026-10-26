@@ -59,6 +59,8 @@ struct Ctx {
   // that are recorded but not submitted yet
   std::vector<WGPUTexture> deadTex;
   std::vector<WGPUBuffer>  deadBuf;
+  // dropped from the bind group cache: recorded pass commands may still use them
+  std::vector<WGPUBindGroup> deadBg;
 
   // mip generation
   WGPUShaderModule  blitModule = nullptr;
@@ -70,6 +72,7 @@ struct Ctx {
 
   struct Stats {
     uint32_t passes = 0, screenPasses = 0, draws = 0, skipped = 0, dispatches = 0, submits = 0;
+    uint32_t bgLookups = 0, bgCreated = 0, bundles = 0;
     } st;
   uint32_t          frame = 0;
   int               dbg   = 0; // window.__OG_GAPI_DEBUG: 2 = magenta clear of screen passes
@@ -1085,7 +1088,35 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   WGPUTextureFormat         passColor[MaxFramebufferAttachments] = {};
   size_t                    passColorCnt = 0;
   WGPUTextureFormat         passDepth    = WGPUTextureFormat_Undefined;
+  bool                      passDepthRO  = false, passStencilRO = false;
   uint32_t                  passW = 0, passH = 0;
+
+  // Render pass commands are recorded and emitted per segment (the draws
+  // between viewport/scissor changes). A segment that repeats the previous
+  // frame's segment at the same position command-for-command is replayed from
+  // a cached GPURenderBundle: one executeBundles call instead of thousands of
+  // setBindGroup/draw calls through JS. Same commands, same resources: the
+  // rendered result is identical.
+  enum OpType : uint32_t { OpPipeline, OpBindGroup, OpVbo, OpIbo, OpDraw, OpDrawIndexed, OpDrawIndirect };
+  struct Op {
+    uint32_t type = 0, a = 0, b = 0, c = 0, d = 0, e = 0;
+    uint64_t x = 0;
+    bool operator==(const Op& o) const { return std::memcmp(this, &o, sizeof(Op))==0; }
+    };
+  struct Segment {
+    std::vector<Op>   ops;
+    WGPUTextureFormat color[MaxFramebufferAttachments] = {};
+    size_t            colorCnt = 0;
+    WGPUTextureFormat depth    = WGPUTextureFormat_Undefined;
+    bool              depthRO = false, stencilRO = false;
+    uint32_t          epoch  = 0;
+    uint32_t          repeat = 0;
+    WGPURenderBundle  bundle = nullptr;
+    };
+  static constexpr size_t   MinBundleOps = 32;
+  std::vector<Op>           seg;
+  std::vector<Segment>      segCache;
+  size_t                    segId = 0;
 
   WPipeline*                gp = nullptr;
   WCompPipeline*            cpso = nullptr;
@@ -1118,6 +1149,9 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     for(auto& c:chunks)
       if(c.buf!=nullptr)
         g.deadBuf.push_back(c.buf);
+    for(auto& sg:segCache)
+      if(sg.bundle!=nullptr)
+        wgpuRenderBundleRelease(sg.bundle);
     }
 
   bool isRecording() const override { return recording; }
@@ -1128,6 +1162,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     enc       = wgpuDeviceCreateCommandEncoder(g.dev, &d);
     recording = true;
     chunkId   = 0;
+    segId     = 0;
     for(auto& c:chunks)
       c.used = 0;
     }
@@ -1175,6 +1210,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
 
   void closePass() {
     if(rp!=nullptr) {
+      flushSegment();
       wgpuRenderPassEncoderEnd(rp);
       wgpuRenderPassEncoderRelease(rp);
       rp = nullptr;
@@ -1221,7 +1257,9 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
         hasDepth = true;
         passDepth = t.info.wgpu;
         da.view = t.attachmentView(0);
+        passDepthRO = false;
         if(desc[i].load==AccessOp::Readonly) {
+          passDepthRO = true;
           da.depthReadOnly = true;
           da.depthLoadOp   = WGPULoadOp_Undefined;
           da.depthStoreOp  = WGPUStoreOp_Undefined;
@@ -1269,6 +1307,9 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     d.colorAttachmentCount   = passColorCnt;
     d.colorAttachments       = ca;
     d.depthStencilAttachment = hasDepth ? &da : nullptr;
+    passStencilRO = hasDepth && da.stencilReadOnly;
+    if(!hasDepth)
+      passDepthRO = false;
     rp    = wgpuCommandEncoderBeginRenderPass(enc, &d);
     ++g.st.passes;
     for(size_t i=0; i<descSize; ++i)
@@ -1360,6 +1401,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     float x = float(r.x), y = float(r.y), w = float(r.w), h = float(r.h);
     if(w<=0 || h<=0)
       return;
+    flushSegment();
     wgpuRenderPassEncoderSetViewport(rp, x, y, w, h, 0.f, 1.f);
     }
 
@@ -1370,6 +1412,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     int x1 = std::min(int(passW), r.x+r.w), y1 = std::min(int(passH), r.y+r.h);
     if(x1<x0) x1 = x0;
     if(y1<y0) y1 = y0;
+    flushSegment();
     wgpuRenderPassEncoderSetScissorRect(rp, uint32_t(x0), uint32_t(y0), uint32_t(x1-x0), uint32_t(y1-y0));
     }
 
@@ -1548,10 +1591,12 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       }
 
     const uint64_t hash = KeyHash()(key);
+    ++g.st.bgLookups;
     if(auto found = g_bindGroups.find(key, hash))
       return found;
+    ++g.st.bgCreated;
     if(g_bindGroups.size()>16384) {
-      g_bindGroups.clear([](WGPUBindGroup bg){ wgpuBindGroupRelease(bg); });
+      g_bindGroups.clear([](WGPUBindGroup bg){ g.deadBg.push_back(bg); });
       g_bindGroupEpoch++;
       }
     WGPUBindGroupDescriptor d = {};
@@ -1584,7 +1629,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     if(pso==nullptr)
       return false;
     if(lastPso!=pso) {
-      wgpuRenderPassEncoderSetPipeline(rp, pso);
+      record(OpPipeline, uint32_t(uintptr_t(pso)));
       lastPso = pso;
       }
     const uint32_t off = pushOffsetFor(lay);
@@ -1592,7 +1637,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     if(bg==nullptr)
       return false;
     if(bg!=lastBg || (lay.pb.size>0 && off!=lastPushOff)) {
-      wgpuRenderPassEncoderSetBindGroup(rp, 0, bg, lay.pb.size>0 ? 1 : 0, &off);
+      record(OpBindGroup, uint32_t(uintptr_t(bg)), lay.pb.size>0 ? 1 : 0, off);
       lastBg      = bg;
       lastPushOff = off;
       }
@@ -1634,8 +1679,133 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     auto* b = static_cast<const WBuffer*>(vbo);
     if(b==nullptr || b==lastVbo)
       return;
-    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, b->impl, 0, b->alloc);
+    record(OpVbo, uint32_t(uintptr_t(b->impl)), 0, 0, 0, 0, b->alloc);
     lastVbo = b;
+    }
+
+  // ------------------------------------------------------------ recorded commands
+  void record(OpType t, uint32_t a, uint32_t b = 0, uint32_t c = 0, uint32_t d = 0, uint32_t e = 0, uint64_t x = 0) {
+    Op op;
+    op.type = t;
+    op.a = a; op.b = b; op.c = c; op.d = d; op.e = e;
+    op.x = x;
+    seg.push_back(op);
+    }
+
+  template<class Enc, class Api>
+  static void replay(Enc enc, const Op* ops, size_t n, const Api& api) {
+    for(size_t i=0; i<n; ++i) {
+      auto& o = ops[i];
+      switch(o.type) {
+        case OpPipeline:
+          api.pipeline(enc, reinterpret_cast<WGPURenderPipeline>(uintptr_t(o.a)));
+          break;
+        case OpBindGroup:
+          api.bindGroup(enc, 0, reinterpret_cast<WGPUBindGroup>(uintptr_t(o.a)), o.b, &o.c);
+          break;
+        case OpVbo:
+          api.vbo(enc, 0, reinterpret_cast<WGPUBuffer>(uintptr_t(o.a)), 0, o.x);
+          break;
+        case OpIbo:
+          api.ibo(enc, reinterpret_cast<WGPUBuffer>(uintptr_t(o.a)), WGPUIndexFormat(o.b), 0, o.x);
+          break;
+        case OpDraw:
+          api.draw(enc, o.a, o.b, o.c, o.d);
+          break;
+        case OpDrawIndexed:
+          api.drawIndexed(enc, o.a, o.b, o.c, int32_t(o.d), o.e);
+          break;
+        case OpDrawIndirect:
+          api.drawIndirect(enc, reinterpret_cast<WGPUBuffer>(uintptr_t(o.a)), o.x);
+          break;
+        }
+      }
+    }
+
+  struct PassApi {
+    decltype(&wgpuRenderPassEncoderSetPipeline)     pipeline     = wgpuRenderPassEncoderSetPipeline;
+    decltype(&wgpuRenderPassEncoderSetBindGroup)    bindGroup    = wgpuRenderPassEncoderSetBindGroup;
+    decltype(&wgpuRenderPassEncoderSetVertexBuffer) vbo          = wgpuRenderPassEncoderSetVertexBuffer;
+    decltype(&wgpuRenderPassEncoderSetIndexBuffer)  ibo          = wgpuRenderPassEncoderSetIndexBuffer;
+    decltype(&wgpuRenderPassEncoderDraw)            draw         = wgpuRenderPassEncoderDraw;
+    decltype(&wgpuRenderPassEncoderDrawIndexed)     drawIndexed  = wgpuRenderPassEncoderDrawIndexed;
+    decltype(&wgpuRenderPassEncoderDrawIndirect)    drawIndirect = wgpuRenderPassEncoderDrawIndirect;
+    };
+  struct BundleApi {
+    decltype(&wgpuRenderBundleEncoderSetPipeline)     pipeline     = wgpuRenderBundleEncoderSetPipeline;
+    decltype(&wgpuRenderBundleEncoderSetBindGroup)    bindGroup    = wgpuRenderBundleEncoderSetBindGroup;
+    decltype(&wgpuRenderBundleEncoderSetVertexBuffer) vbo          = wgpuRenderBundleEncoderSetVertexBuffer;
+    decltype(&wgpuRenderBundleEncoderSetIndexBuffer)  ibo          = wgpuRenderBundleEncoderSetIndexBuffer;
+    decltype(&wgpuRenderBundleEncoderDraw)            draw         = wgpuRenderBundleEncoderDraw;
+    decltype(&wgpuRenderBundleEncoderDrawIndexed)     drawIndexed  = wgpuRenderBundleEncoderDrawIndexed;
+    decltype(&wgpuRenderBundleEncoderDrawIndirect)    drawIndirect = wgpuRenderBundleEncoderDrawIndirect;
+    };
+
+  bool segmentMatches(const Segment& sg) const {
+    return sg.epoch==g_bindGroupEpoch && sg.colorCnt==passColorCnt && sg.depth==passDepth &&
+           sg.depthRO==passDepthRO && sg.stencilRO==passStencilRO &&
+           std::equal(passColor, passColor+passColorCnt, sg.color) &&
+           sg.ops.size()==seg.size() &&
+           std::memcmp(sg.ops.data(), seg.data(), seg.size()*sizeof(Op))==0;
+    }
+
+  WGPURenderBundle makeBundle() const {
+    WGPURenderBundleEncoderDescriptor d = {};
+    d.colorFormatCount   = passColorCnt;
+    d.colorFormats       = passColor;
+    d.depthStencilFormat = passDepth;
+    d.sampleCount        = 1;
+    d.depthReadOnly      = passDepthRO;
+    d.stencilReadOnly    = passStencilRO;
+    auto be = wgpuDeviceCreateRenderBundleEncoder(g.dev, &d);
+    replay(be, seg.data(), seg.size(), BundleApi());
+    auto bundle = wgpuRenderBundleEncoderFinish(be, nullptr);
+    wgpuRenderBundleEncoderRelease(be);
+    return bundle;
+    }
+
+  // emits the recorded commands of the current segment into the pass
+  void flushSegment() {
+    if(rp==nullptr || seg.empty()) {
+      seg.clear();
+      return;
+      }
+    if(seg.size()<MinBundleOps || (g.dbg & 4)) {
+      replay(rp, seg.data(), seg.size(), PassApi());
+      } else {
+      if(segId>=segCache.size())
+        segCache.resize(segId+1);
+      auto& sg = segCache[segId];
+      ++segId;
+      if(segmentMatches(sg)) {
+        // second identical frame in a row: the commands are stable
+        if(sg.bundle==nullptr && ++sg.repeat>=1)
+          sg.bundle = makeBundle();
+        if(sg.bundle!=nullptr) {
+          wgpuRenderPassEncoderExecuteBundles(rp, 1, &sg.bundle);
+          ++g.st.bundles;
+          } else {
+          replay(rp, seg.data(), seg.size(), PassApi());
+          }
+        } else {
+        replay(rp, seg.data(), seg.size(), PassApi());
+        if(sg.bundle!=nullptr)
+          wgpuRenderBundleRelease(sg.bundle);
+        sg.bundle   = nullptr;
+        sg.repeat   = 0;
+        sg.epoch    = g_bindGroupEpoch;
+        sg.colorCnt = passColorCnt;
+        sg.depth    = passDepth;
+        sg.depthRO  = passDepthRO;
+        sg.stencilRO = passStencilRO;
+        std::copy(passColor, passColor+passColorCnt, sg.color);
+        sg.ops.swap(seg);
+        }
+      }
+    seg.clear();
+    // executeBundles resets pipeline/bind group/buffers: the next segment
+    // sets everything it uses
+    resetEncoderState();
     }
 
   // ------------------------------------------------------------ draws
@@ -1647,8 +1817,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       return;
     if(vbo!=nullptr && !gp->decl.empty())
       bindVbo(vbo);
-    wgpuRenderPassEncoderDraw(rp, uint32_t(vertexCount), uint32_t(instanceCount),
-                              uint32_t(offset), uint32_t(firstInstance));
+    record(OpDraw, uint32_t(vertexCount), uint32_t(instanceCount), uint32_t(offset), uint32_t(firstInstance));
     }
 
   void drawIndexed(const AbstractGraphicsApi::Buffer* vbo, size_t stride, size_t voffset,
@@ -1662,20 +1831,19 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       bindVbo(vbo);
     auto& ib = static_cast<const WBuffer&>(ibo);
     if(lastIbo!=&ib) {
-      wgpuRenderPassEncoderSetIndexBuffer(rp, ib.impl,
-                                          cls==Detail::IndexClass::i32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16,
-                                          0, ib.alloc);
+      record(OpIbo, uint32_t(uintptr_t(ib.impl)),
+             cls==Detail::IndexClass::i32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16, 0, 0, 0, ib.alloc);
       lastIbo = &ib;
       }
-    wgpuRenderPassEncoderDrawIndexed(rp, uint32_t(isize), uint32_t(instanceCount), uint32_t(ioffset),
-                                     int32_t(voffset), uint32_t(firstInstance));
+    record(OpDrawIndexed, uint32_t(isize), uint32_t(instanceCount), uint32_t(ioffset),
+           uint32_t(int32_t(voffset)), uint32_t(firstInstance));
     }
 
   void drawIndirect(const AbstractGraphicsApi::Buffer& indirect, size_t offset) override {
     if(!flushGraphics(0))
       return;
     auto& b = static_cast<const WBuffer&>(indirect);
-    wgpuRenderPassEncoderDrawIndirect(rp, b.impl, offset);
+    record(OpDrawIndirect, uint32_t(uintptr_t(b.impl)), 0, 0, 0, 0, offset);
     }
 
   void dispatch(size_t x, size_t y, size_t z) override {
@@ -2095,7 +2263,7 @@ void WebGapi::present(Device*, Swapchain* sw) {
   if(g.frame<=3 || g.frame%300==0) {
     Log::i("[WebGPU] frame ", g.frame, ": passes=", g.st.passes, " screen=", g.st.screenPasses,
            " draws=", g.st.draws, " skipped=", g.st.skipped, " dispatch=", g.st.dispatches,
-           " submits=", g.st.submits, " errors=", g.errors);
+           " submits=", g.st.submits, " bg=", g.st.bgLookups, "/", g.st.bgCreated, " bundles=", g.st.bundles, " errors=", g.errors);
     }
   g.st = Ctx::Stats();
   g.dbg = EM_ASM_INT({ window.__ogFrame = $0; return (typeof window.__OG_GAPI_DEBUG === 'number') ? window.__OG_GAPI_DEBUG : 0; }, g.frame);
@@ -2110,6 +2278,9 @@ void WebGapi::present(Device*, Swapchain* sw) {
     wgpuBufferRelease(b);
     }
   g.deadBuf.clear();
+  for(auto b:g.deadBg)
+    wgpuBindGroupRelease(b);
+  g.deadBg.clear();
   }
 
 std::shared_ptr<AbstractGraphicsApi::Fence> WebGapi::submit(Device*, CommandBuffer* cmd) {
