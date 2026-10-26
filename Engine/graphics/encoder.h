@@ -61,6 +61,10 @@ class Encoder<Tempest::CommandBuffer> {
 
     void setDebugMarker(std::string_view tag);
 
+    // see AbstractGraphicsApi::CommandBuffer::replayBegin
+    bool tryReplay(uint64_t token, uint64_t gen);
+    void endReplay(uint64_t token, uint64_t gen);
+
     // non-indexed + empty vbo
     void draw(std::nullptr_t vbo, size_t offset, size_t count) { implDraw({},0,offset,count,0,1); }
     void draw(std::nullptr_t vbo, size_t offset, size_t count, size_t firstInstance, size_t instanceCount) { implDraw({},0,offset,count,firstInstance,instanceCount); }

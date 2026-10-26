@@ -82,9 +82,10 @@ struct Ctx {
 
   struct Stats {
     uint32_t passes = 0, screenPasses = 0, draws = 0, skipped = 0, dispatches = 0, submits = 0;
-    uint32_t bgLookups = 0, bgCreated = 0, bundles = 0, specHit = 0, specMiss = 0;
+    uint32_t bgLookups = 0, bgCreated = 0, bundles = 0, specHit = 0, specMiss = 0, chainHits = 0, chainChecked = 0, chainWrong = 0;
     } st;
   uint32_t          frame = 0;
+  uint32_t          resEpoch = 0; // bumped by every GPU resource creation, see replayBegin
   int               dbg   = 0; // window.__OG_GAPI_DEBUG: 2 = magenta clear of screen passes
   };
 Ctx g;
@@ -1091,6 +1092,9 @@ struct BindGroupCache {
   };
 BindGroupCache g_bindGroups;
 uint32_t g_bindGroupEpoch = 0;
+uint32_t g_segVer = 0;
+uint32_t g_chunkWrites = 0; // changes of push data: the debug check of chain replay
+
 
 void reportFirstUse(const std::string& tag) {
   static std::unordered_map<std::string, bool> seen;
@@ -1238,6 +1242,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     std::vector<size_t>   used; // push chunk fill after the segment, from start.chunk on
     uint32_t          resGen = 0, stateGen = 0;
     bool              stable = false;
+    uint32_t          ver = 0; // changes when the ops are produced again
     };
   static constexpr size_t   MinBundleOps = 32;
   std::vector<Op>           seg;
@@ -1299,6 +1304,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       auto&    sh  = shape[off/PushAlign];
       if(sh.sz==sz && sh.len==len && std::memcmp(dst, data, len)==0)
         return;
+      ++g_chunkWrites;
       std::memcpy(dst, data, len);
       std::memset(dst+len, 0, sz-len);
       sh.sz  = uint32_t(sz);
@@ -1426,6 +1432,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
                       AbstractGraphicsApi::Swapchain** sw, const uint32_t* imgId) override {
     (void)imgId;
     closePass();
+    ++passSerial;
 
     WGPURenderPassColorAttachment        ca[MaxFramebufferAttachments] = {};
     WGPURenderPassDepthStencilAttachment da = {};
@@ -1953,6 +1960,130 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     decltype(&wgpuRenderBundleEncoderDrawIndirect)    drawIndirect = wgpuRenderBundleEncoderDrawIndirect;
     };
 
+
+  // Chains: the commands of one caller (a drawCommon call: hundreds of draws) cut into whole
+  // segments. When the caller says nothing it feeds into them changed (gen) and no GPU resource
+  // was created or destroyed, the segments of last frame are executed without recording the calls
+  // again: the call log would only be compared with the previous one to find that it is the same.
+  struct Chain {
+    bool                  valid = false;
+    uint64_t              gen = 0;
+    uint32_t              epoch = 0, resGen = 0, stateGen = 0, bgEpoch = 0;
+    size_t                first = 0, n = 0;
+    SegStart              start;
+    std::vector<uint32_t> ver;
+    AbstractGraphicsApi::Pipeline* endGp = nullptr;
+    Detail::Bindings      endBind;
+    uint8_t               endPush[256] = {};
+    size_t                endPushSize  = 0;
+    };
+  std::unordered_map<uint64_t, Chain> chains;
+  uint32_t                  uncachedSegs = 0;
+  uint32_t                  passSerial   = 0;
+  struct { bool open = false, skipped = false, verify = false; uint32_t writes0 = 0; std::vector<uint32_t> vers; uint64_t token = 0; size_t first = 0; uint32_t uncached = 0, pass = 0; SegStart start; } chainRec;
+
+  bool replayBegin(uint64_t token, uint64_t gen) override {
+    chainRec.open = false;
+    if(rp==nullptr || (g.dbg & 4))
+      return false;
+    // the chain is made of whole segments
+    if(!raw.empty() || !seg.empty())
+      flushSegment();
+    chainRec.open     = true;
+    chainRec.skipped  = false;
+    chainRec.verify   = false;
+    chainRec.token    = token;
+    chainRec.first    = segId;
+    chainRec.uncached = uncachedSegs;
+    chainRec.pass     = passSerial;
+    chainRec.start    = start;
+
+    auto it = chains.find(token);
+    if(it==chains.end())
+      return false;
+    auto& ch = it->second;
+    if(!ch.valid || ch.gen!=gen || ch.first!=segId || ch.epoch!=g.resEpoch || ch.resGen!=g.resGen ||
+       ch.stateGen!=g.stateGen || ch.bgEpoch!=g_bindGroupEpoch || segId+ch.n>segCache.size() || !(ch.start==start))
+      return false;
+    for(size_t i=0; i<ch.n; ++i) {
+      auto& sg = segCache[segId+i];
+      if(!sg.stable || sg.bundle==nullptr || sg.ver!=ch.ver[i] || sg.epoch!=g_bindGroupEpoch ||
+         sg.resGen!=g.resGen || sg.stateGen!=g.stateGen ||
+         sg.colorCnt!=passColorCnt || sg.depth!=passDepth || sg.depthRO!=passDepthRO || sg.stencilRO!=passStencilRO ||
+         !std::equal(passColor, passColor+passColorCnt, sg.color))
+        return false;
+      }
+
+    if(g.dbg & 16) {
+      // debug: record normally and check in replayEnd that the skip would have been right
+      chainRec.verify  = true;
+      chainRec.writes0 = g_chunkWrites;
+      chainRec.vers    = ch.ver;
+      return false;
+      }
+
+    for(size_t i=0; i<ch.n; ++i) {
+      auto& sg = segCache[segId+i];
+      wgpuRenderPassEncoderExecuteBundles(rp, 1, &sg.bundle);
+      ++g.st.bundles;
+      for(size_t u=0; u<sg.used.size(); ++u)
+        chunks[sg.start.chunk+u].used = sg.used[u];
+      if(!sg.used.empty())
+        chunkId = sg.start.chunk + sg.used.size() - 1;
+      }
+    segId += ch.n;
+    gp       = static_cast<WPipeline*>(ch.endGp);
+    bind     = ch.endBind;
+    std::memcpy(push, ch.endPush, ch.endPushSize);
+    pushSize = ch.endPushSize;
+    resetEncoderState();
+    beginSegment();
+    chainRec.skipped = true;
+    ++g.st.chainHits;
+    return true;
+    }
+
+  void replayEnd(uint64_t token, uint64_t gen) override {
+    if(!chainRec.open || chainRec.token!=token)
+      return;
+    chainRec.open = false;
+    if(chainRec.skipped || rp==nullptr || chainRec.pass!=passSerial)
+      return;
+    flushSegment();
+    if(chainRec.verify) {
+      bool same = (segId-chainRec.first==chainRec.vers.size()) && chainRec.uncached==uncachedSegs &&
+                  g_chunkWrites==chainRec.writes0;
+      for(size_t i=0; same && i<chainRec.vers.size(); ++i)
+        same = segCache[chainRec.first+i].ver==chainRec.vers[i];
+      ++g.st.chainChecked;
+      if(!same) {
+        ++g.st.chainWrong;
+        Log::e("[WebGPU] chain replay would have been wrong: token=", token, " segs=", segId-chainRec.first, "/", chainRec.vers.size(),
+               " pushWrites=", g_chunkWrites-chainRec.writes0);
+        }
+      }
+    auto& ch = chains[token];
+    ch.valid = false;
+    if(chainRec.uncached!=uncachedSegs || segId<=chainRec.first || (g.dbg & 4))
+      return;
+    ch.gen      = gen;
+    ch.epoch    = g.resEpoch;
+    ch.resGen   = g.resGen;
+    ch.stateGen = g.stateGen;
+    ch.bgEpoch  = g_bindGroupEpoch;
+    ch.first    = chainRec.first;
+    ch.n        = segId-chainRec.first;
+    ch.start    = chainRec.start;
+    ch.ver.clear();
+    for(size_t i=0; i<ch.n; ++i)
+      ch.ver.push_back(segCache[ch.first+i].ver);
+    ch.endGp       = gp;
+    ch.endBind     = bind;
+    std::memcpy(ch.endPush, push, pushSize);
+    ch.endPushSize = pushSize;
+    ch.valid       = true;
+    }
+
   bool segmentMatches(const Segment& sg) const {
     return sg.epoch==g_bindGroupEpoch && sg.colorCnt==passColorCnt && sg.depth==passDepth &&
            sg.depthRO==passDepthRO && sg.stencilRO==passStencilRO &&
@@ -2120,7 +2251,9 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       beginSegment();
       return;
       }
-    if(seg.size()<MinBundleOps || (g.dbg & 4)) {
+    // inside a chain every segment is kept: a chain can only be skipped as a whole
+    if((seg.size()<MinBundleOps && !chainRec.open) || (g.dbg & 4)) {
+      ++uncachedSegs;
       replay(rp, seg.data(), seg.size(), PassApi());
       } else {
       if(segId>=segCache.size())
@@ -2150,6 +2283,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
         sg.stencilRO = passStencilRO;
         std::copy(passColor, passColor+passColorCnt, sg.color);
         sg.ops.swap(seg);
+        sg.ver = ++g_segVer;
         }
       sg.start    = start;
       sg.raw.swap(raw);
@@ -2478,18 +2612,22 @@ AbstractGraphicsApi::PShader WebGapi::createShader(Device*, const void* source, 
   }
 
 AbstractGraphicsApi::DescArray* WebGapi::createDescriptors(Device*, AbstractGraphicsApi::Texture**, size_t, uint32_t, const Sampler&) {
+  ++g.resEpoch;
   return new WDescArray();
   }
 
 AbstractGraphicsApi::DescArray* WebGapi::createDescriptors(Device*, AbstractGraphicsApi::Texture**, size_t, uint32_t) {
+  ++g.resEpoch;
   return new WDescArray();
   }
 
 AbstractGraphicsApi::DescArray* WebGapi::createDescriptors(Device*, AbstractGraphicsApi::Buffer**, size_t) {
+  ++g.resEpoch;
   return new WDescArray();
   }
 
 AbstractGraphicsApi::PBuffer WebGapi::createBuffer(Device*, const void* mem, size_t size, MemUsage, BufferHeap heap) {
+  ++g.resEpoch;
   return PBuffer(new WBuffer(mem, size, heap));
   }
 
@@ -2503,6 +2641,7 @@ static WGPUTextureUsageFlags textureUsage(const FormatInfo& info, bool storage) 
   }
 
 AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, const Pixmap& p, TextureFormat frm, uint32_t mips) {
+  ++g.resEpoch;
   std::unique_ptr<WTexture> t(new WTexture());
   const TextureFormat pfrm = p.format();
   t->frm  = frm;
@@ -2601,6 +2740,7 @@ AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, const Pixmap& p, T
   }
 
 AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, uint32_t w, uint32_t h, uint32_t mips, TextureFormat frm) {
+  ++g.resEpoch;
   std::unique_ptr<WTexture> t(new WTexture());
   t->frm  = frm;
   t->info = formatInfo(frm);
@@ -2612,6 +2752,7 @@ AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, uint32_t w, uint32
   }
 
 AbstractGraphicsApi::PTexture WebGapi::createStorage(Device*, uint32_t w, uint32_t h, uint32_t mips, TextureFormat frm) {
+  ++g.resEpoch;
   std::unique_ptr<WTexture> t(new WTexture());
   t->frm  = frm;
   t->info = formatInfo(frm);
@@ -2623,6 +2764,7 @@ AbstractGraphicsApi::PTexture WebGapi::createStorage(Device*, uint32_t w, uint32
   }
 
 AbstractGraphicsApi::PTexture WebGapi::createStorage(Device*, uint32_t w, uint32_t h, uint32_t d, uint32_t mips, TextureFormat frm) {
+  ++g.resEpoch;
   std::unique_ptr<WTexture> t(new WTexture());
   t->frm  = frm;
   t->info = formatInfo(frm);
@@ -2732,7 +2874,7 @@ void WebGapi::present(Device*, Swapchain* sw) {
     Log::i("[WebGPU] frame ", g.frame, ": passes=", g.st.passes, " screen=", g.st.screenPasses,
            " draws=", g.st.draws, " skipped=", g.st.skipped, " dispatch=", g.st.dispatches,
            " submits=", g.st.submits, " bg=", g.st.bgLookups, "/", g.st.bgCreated, " bundles=", g.st.bundles,
-           " spec=", g.st.specHit, "/", g.st.specMiss, " resGen=", g.resGen, " errors=", g.errors);
+           " spec=", g.st.specHit, "/", g.st.specMiss, " chains=", g.st.chainHits, "/", g.st.chainChecked, "/", g.st.chainWrong, " resGen=", g.resGen, " errors=", g.errors);
     }
   g.st = Ctx::Stats();
   g.dbg = EM_ASM_INT({ window.__ogFrame = $0; return (typeof window.__OG_GAPI_DEBUG === 'number') ? window.__OG_GAPI_DEBUG : 0; }, g.frame);

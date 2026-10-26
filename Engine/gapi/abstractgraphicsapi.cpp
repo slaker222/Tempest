@@ -81,6 +81,13 @@ void AbstractGraphicsApi::CommandBuffer::setPushData(const void* data, size_t si
   throw std::system_error(Tempest::GraphicsErrc::UnsupportedExtension);
   }
 
+bool AbstractGraphicsApi::CommandBuffer::replayBegin(uint64_t, uint64_t) {
+  return false;
+  }
+
+void AbstractGraphicsApi::CommandBuffer::replayEnd(uint64_t, uint64_t) {
+  }
+
 void AbstractGraphicsApi::CommandBuffer::setDebugMarker(std::string_view tag) {
   (void)tag;
   }

@@ -608,6 +608,13 @@ namespace Tempest {
         virtual void setScissor (const Rect& r)=0;
         virtual void setDebugMarker(std::string_view tag);
 
+        // A caller that knows its commands repeat can ask for last frame's recording of them:
+        // true when the same commands (token, gen) were recorded at this position before and
+        // everything they use is still alive; they are then already in the buffer and the
+        // calls up to endReplay must be skipped. Otherwise record them and call endReplay.
+        virtual bool replayBegin(uint64_t token, uint64_t gen);
+        virtual void replayEnd  (uint64_t token, uint64_t gen);
+
         virtual void draw        (const Buffer* vbo, size_t stride, size_t offset, size_t vertexCount,
                                   size_t firstInstance, size_t instanceCount) = 0;
         virtual void drawIndexed (const Buffer* vbo, size_t stride, size_t voffset,

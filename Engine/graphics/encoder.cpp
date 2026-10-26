@@ -62,6 +62,14 @@ void Encoder<Tempest::CommandBuffer>::setScissor(const Rect &vp) {
   impl->setScissor(vp);
   }
 
+bool Encoder<Tempest::CommandBuffer>::tryReplay(uint64_t token, uint64_t gen) {
+  return impl->replayBegin(token, gen);
+  }
+
+void Encoder<Tempest::CommandBuffer>::endReplay(uint64_t token, uint64_t gen) {
+  impl->replayEnd(token, gen);
+  }
+
 void Encoder<Tempest::CommandBuffer>::setDebugMarker(std::string_view tag) {
   impl->setDebugMarker(tag);
   }
