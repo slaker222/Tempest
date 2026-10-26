@@ -20,7 +20,10 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -257,11 +260,41 @@ std::unordered_map<const void*, int> g_buffers; // Sound::Data -> AudioBuffer id
 struct Stream {
   virtual ~Stream() = default;
   virtual void pump() = 0;
+  virtual void prefill() {}
   };
 std::vector<Stream*> g_streams;
 bool                 g_pumpStarted = false;
 
+#if defined(__EMSCRIPTEN_PTHREADS__)
+// Streams (music) are rendered ahead on an audio thread, as OpenAL does on
+// native builds; the main thread only hands the samples to Web Audio. The
+// main thread never blocks on this lock: the audio thread may be waiting for
+// a call proxied to the main thread.
+std::mutex g_audioMx;
+
+void lockAudioOnMain() {
+  while(!g_audioMx.try_lock())
+    emscripten_proxy_execute_queue(emscripten_proxy_get_system_queue());
+  }
+
+void audioThread() {
+  for(;;) {
+    {
+    std::lock_guard<std::mutex> guard(g_audioMx);
+    for(size_t i=0; i<g_streams.size(); ++i)
+      g_streams[i]->prefill();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+#endif
+
 void pumpAll(void*) {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+  std::unique_lock<std::mutex> lck(g_audioMx, std::try_to_lock);
+  if(!lck.owns_lock())
+    return; // Web Audio is queued 0.3 s ahead: the next pump catches up
+#endif
   for(size_t i=0; i<g_streams.size(); ++i)
     g_streams[i]->pump();
   }
@@ -291,6 +324,9 @@ SoundDevice::SoundDevice() : data(new Data()) {
   if(!g_pumpStarted) {
     g_pumpStarted = true;
     emscripten_set_interval(pumpAll, 40, nullptr);
+#if defined(__EMSCRIPTEN_PTHREADS__)
+    std::thread(audioThread).detach();
+#endif
     }
   }
 
@@ -391,8 +427,15 @@ struct SoundEffect::Impl : Stream {
   Impl(std::unique_ptr<SoundProducer>&& p) : producer(std::move(p)) {
     onMain([this]() {
       src = oga_source(0, producer->channels, producer->frequency);
-      if(src!=0)
-        g_streams.push_back(this);
+      if(src==0)
+        return;
+#if defined(__EMSCRIPTEN_PTHREADS__)
+      lockAudioOnMain();
+      g_streams.push_back(this);
+      g_audioMx.unlock();
+#else
+      g_streams.push_back(this);
+#endif
       });
     }
 
@@ -402,9 +445,15 @@ struct SoundEffect::Impl : Stream {
 
   void release() {
     if(producer!=nullptr) {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+      lockAudioOnMain();
+#endif
       auto it = std::find(g_streams.begin(), g_streams.end(), static_cast<Stream*>(this));
       if(it!=g_streams.end())
         g_streams.erase(it);
+#if defined(__EMSCRIPTEN_PTHREADS__)
+      g_audioMx.unlock();
+#endif
       }
     if(src!=0)
       oga_source_free(src);
@@ -416,10 +465,45 @@ struct SoundEffect::Impl : Stream {
       const int frames = std::min(need, 2048);
       // renderSound implementations may write up to 8 bytes per frame
       scratch.assign(size_t(frames)*4, 0);
-      producer->renderSound(scratch.data(), size_t(frames));
+      const int ready = takeAhead(scratch.data(), frames);
+      if(ready<frames)
+        producer->renderSound(scratch.data()+size_t(ready)*producer->channels, size_t(frames-ready));
       oga_stream_push(src, scratch.data(), frames);
       need -= frames;
       }
+    }
+
+  // samples rendered ahead (audio thread), aheadCnt frames from aheadRd on
+  static constexpr int   AheadFrames = 4096, AheadChunk = 1024;
+  std::vector<int16_t>   ahead, aheadTmp;
+  int                    aheadRd = 0, aheadCnt = 0;
+
+  void prefill() override {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+    const int ch = producer->channels;
+    if(ahead.empty())
+      ahead.resize(size_t(AheadFrames)*ch);
+    while(aheadCnt+AheadChunk<=AheadFrames) {
+      aheadTmp.assign(size_t(AheadChunk)*4, 0);
+      producer->renderSound(aheadTmp.data(), size_t(AheadChunk));
+      for(int i=0; i<AheadChunk; ++i) {
+        const int at = (aheadRd+aheadCnt+i)%AheadFrames;
+        std::memcpy(&ahead[size_t(at)*ch], &aheadTmp[size_t(i)*ch], size_t(ch)*sizeof(int16_t));
+        }
+      aheadCnt += AheadChunk;
+      }
+#endif
+    }
+
+  int takeAhead(int16_t* dst, int frames) {
+    const int ch = producer->channels;
+    const int n  = std::min(frames, aheadCnt);
+    for(int i=0; i<n; ++i) {
+      std::memcpy(dst+size_t(i)*ch, &ahead[size_t(aheadRd)*ch], size_t(ch)*sizeof(int16_t));
+      aheadRd = (aheadRd+1)%AheadFrames;
+      }
+    aheadCnt -= n;
+    return n;
     }
   };
 
