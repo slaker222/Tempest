@@ -1,5 +1,6 @@
 #if defined(__EMSCRIPTEN__)
 
+#include "../../gapi/webdpr.h"
 #include "webapi.h"
 
 #include <Tempest/Event>
@@ -297,25 +298,30 @@ static void mainLoopIteration() {
         uint32_t curW = static_cast<uint32_t>(cssW);
         uint32_t curH = static_cast<uint32_t>(cssH);
 
-        // self-healing: if the canvas drawing buffer drifted away from
-        // css*dpr (a resize dispatch was lost or partially applied), force
-        // a new resize event even when the tracked window size matches
+        // the canvas drawing buffer follows css size * pixel ratio (WSwapchain::reset;
+        // the ratio can change with the page's "screen sharpness"); when it is not
+        // what the swapchain would make now, rebuild the swapchain. Widget::resize
+        // ignores an unchanged size, so the rebuild goes through a one pixel detour.
         bool canvasDrift = false;
         int cw = 0, ch = 0;
         if(emscripten_get_canvas_element_size("#canvas", &cw, &ch) == EMSCRIPTEN_RESULT_SUCCESS) {
-          const double dpr = emscripten_get_device_pixel_ratio();
-          // the same formula as the swapchain (WSwapchain::reset), from the
-          // fractional css size: with the truncated size a phone's dpr turned the
-          // rounding error into a "drift" on every frame, and every frame rebuilt
-          // all render targets (15-20 FPS in landscape)
+          const double dpr = webPixelRatio(cssW, cssH);
           const int expW = std::max(1, int(cssW * dpr + 0.5));
           const int expH = std::max(1, int(cssH * dpr + 0.5));
           canvasDrift = (std::abs(cw - expW) > 2) || (std::abs(ch - expH) > 2);
           }
+        static double lastHeal = -1e9;
+        const double nowMs = emscripten_get_now();
+        if(canvasDrift && nowMs-lastHeal < 1000)
+          canvasDrift = false; // never more than once a second
 
         if((curW > 0 && curH > 0 && (curW != s_currentWindow->width || curH != s_currentWindow->height)) || canvasDrift) {
-          if(canvasDrift)
+          if(canvasDrift) {
+            lastHeal = nowMs;
             Log::i("[WebApi] canvas drift detected: buffer=", cw, "x", ch, " css=", curW, "x", curH);
+            SizeEvent detour{int(curW)+1, int(curH)};
+            WebApi::dispatchResize(*s_currentWindow->owner, detour);
+            }
           s_currentWindow->width  = curW;
           s_currentWindow->height = curH;
           SizeEvent e{int(curW), int(curH)};

@@ -1,5 +1,6 @@
 #if defined(__EMSCRIPTEN__)
 
+#include "webdpr.h"
 #include "webgapi.h"
 
 #include <Tempest/Log>
@@ -920,7 +921,7 @@ struct WSwapchain : AbstractGraphicsApi::Swapchain {
   void reset() override {
     double cssW = 0, cssH = 0;
     emscripten_get_element_css_size("#canvas", &cssW, &cssH);
-    const double dpr = emscripten_get_device_pixel_ratio();
+    const double dpr = webPixelRatio(cssW, cssH);
     width  = uint32_t(std::max(1.0, cssW*dpr + 0.5));
     height = uint32_t(std::max(1.0, cssH*dpr + 0.5));
     if(cur!=nullptr) {
