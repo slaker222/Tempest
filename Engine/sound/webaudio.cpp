@@ -141,16 +141,23 @@ EM_JS(void, oga_set, (int id, int what, float x, float y, float z), {
   const s = A && A.srcs[id];
   if (!s) return;
   const t = A.ctx.currentTime;
+  // every setValueAtTime adds an automation event: skip unchanged values
   if (what === 0) {
+    const p = s.pos;
+    if (p && p[0] === x && p[1] === y && p[2] === z) return;
     s.pos = [x, y, z];
     s.panner.positionX.setValueAtTime(x, t);
     s.panner.positionY.setValueAtTime(y, t);
     s.panner.positionZ.setValueAtTime(z, t);
   } else if (what === 1) {
-    s.maxDist = Math.max(x, 1e-3);
-    s.panner.maxDistance = s.maxDist;
+    const d = Math.max(x, 1e-3);
+    if (s.maxDist === d) return;
+    s.maxDist = d;
+    s.panner.maxDistance = d;
   } else if (what === 2) {
+    if (s.gain === x && s.gainSet) return;
     s.gain = x;
+    s.gainSet = true;
     s.gainNode.gain.setValueAtTime(x, t);
   }
 });
@@ -198,6 +205,10 @@ EM_JS(void, oga_listener, (int what, float a, float b, float c, float d, float e
   const A = Module.oga;
   if (!A || !A.ctx) return;
   const L = A.ctx.listener, t = A.ctx.currentTime;
+  const k = what === 2 ? [a] : what === 0 ? [a, b, c] : [a, b, c, d, e, f];
+  const last = (A.lst || (A.lst = []))[what];
+  if (last && last.length === k.length && last.every((v, i) => v === k[i])) return;
+  A.lst[what] = k;
   if (what === 0) {
     if (L.positionX) { L.positionX.setValueAtTime(a, t); L.positionY.setValueAtTime(b, t); L.positionZ.setValueAtTime(c, t); }
     else L.setPosition(a, b, c);

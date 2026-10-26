@@ -3,6 +3,10 @@
 #include <cmath>
 #include <algorithm>
 
+#if defined(__wasm_simd128__)
+#include <wasm_simd128.h>
+#endif
+
 //#include <thirdparty/nv_math/nv_matrix.h>
 // code is based on NvMath
 #define KD_FLT_EPSILON 1.19209290E-07F
@@ -203,6 +207,22 @@ static void NvMultMat4x3f(float r[4][4], const float a[4][4], const float b[4][4
 
 static void NvMultMat4x4f(float r[4][4], const float a[4][4], const float b[4][4])
 {
+#if defined(__wasm_simd128__)
+    // row i of r = sum_k b[i][k] * row k of a; same operation order as the
+    // scalar code below (wasm has no fused multiply-add), so bit-identical
+    const v128_t a0 = wasm_v128_load(a[0]);
+    const v128_t a1 = wasm_v128_load(a[1]);
+    const v128_t a2 = wasm_v128_load(a[2]);
+    const v128_t a3 = wasm_v128_load(a[3]);
+    for(int i=0; i<4; ++i) {
+      v128_t x = wasm_f32x4_mul(a0, wasm_f32x4_splat(b[i][0]));
+      x = wasm_f32x4_add(x, wasm_f32x4_mul(a1, wasm_f32x4_splat(b[i][1])));
+      x = wasm_f32x4_add(x, wasm_f32x4_mul(a2, wasm_f32x4_splat(b[i][2])));
+      x = wasm_f32x4_add(x, wasm_f32x4_mul(a3, wasm_f32x4_splat(b[i][3])));
+      wasm_v128_store(r[i], x);
+      }
+    return;
+#endif
     //assert(NvDifferentMatsf(r, a) && NvDifferentMatsf(r, b));
 
     r[0][0] = a[0][0]*b[0][0]+a[1][0]*b[0][1]+a[2][0]*b[0][2]+a[3][0]*b[0][3];
