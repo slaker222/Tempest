@@ -241,8 +241,15 @@ bool WebApi::implIsFullscreen(SystemApi::Window* w) {
   return w ? (w->fullscreen || isPointerLocked()) : false;
   }
 
-float WebApi::implUiScale(SystemApi::Window*) {
-  return static_cast<float>(emscripten_get_device_pixel_ratio());
+float WebApi::implUiScale(SystemApi::Window* w) {
+  // The window is measured in css pixels and the swapchain is stretched over
+  // it: the device pixel ratio is already applied. The interface is laid out
+  // for 500+ pixel high screens; a phone (some 400 css pixels high in
+  // landscape) gets it smaller, still readable.
+  float scale = 1.f;
+  if(w!=nullptr && w->height>0)
+    scale = std::clamp(float(w->height)/500.f, 0.7f, 1.f);
+  return scale;
   }
 
 void WebApi::implSetWindowTitle(SystemApi::Window*, const char* utf8) {
