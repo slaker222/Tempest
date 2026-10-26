@@ -55,6 +55,11 @@ struct Ctx {
   bool              firstInstance = false;
   WGPUTextureFormat canvasFormat  = WGPUTextureFormat_BGRA8Unorm;
   uint64_t          uid           = 1;
+  // bumped when a resource object dies (its address may be reused) and when a
+  // shader/pipeline finishes async validation: speculative segment replay
+  // relies on neither having changed since the segment was recorded
+  uint32_t          resGen        = 0;
+  uint32_t          stateGen      = 0;
 
   std::unordered_map<uint32_t, WGPUSampler> samplers;
 
@@ -75,7 +80,7 @@ struct Ctx {
 
   struct Stats {
     uint32_t passes = 0, screenPasses = 0, draws = 0, skipped = 0, dispatches = 0, submits = 0;
-    uint32_t bgLookups = 0, bgCreated = 0, bundles = 0;
+    uint32_t bgLookups = 0, bgCreated = 0, bundles = 0, specHit = 0, specMiss = 0;
     } st;
   uint32_t          frame = 0;
   int               dbg   = 0; // window.__OG_GAPI_DEBUG: 2 = magenta clear of screen passes
@@ -113,6 +118,7 @@ void scopeEnd(std::string what, std::shared_ptr<bool> bad = nullptr) {
     if(type!=WGPUErrorType_NoError) {
       if(tag->bad)
         *tag->bad = true;
+      ++g.stateGen;
       ++g.errors;
       if(g.errors<200)
         Log::e("[WebGPU] ", tag->what, ": ", msg ? msg : "");
@@ -281,6 +287,7 @@ struct WDevice : AbstractGraphicsApi::Device {
 
 struct WBuffer : AbstractGraphicsApi::Buffer {
   WGPUBuffer           impl  = nullptr;
+  bool                 bound = false; // used by a recorded render pass command
   uint64_t             size  = 0;  // requested size
   uint64_t             alloc = 0;  // aligned allocation size
   uint64_t             uid   = 0;
@@ -306,6 +313,8 @@ struct WBuffer : AbstractGraphicsApi::Buffer {
     }
 
   ~WBuffer() override {
+    if(bound)
+      ++g.resGen;
     if(impl!=nullptr)
       g.deadBuf.push_back(impl);
     }
@@ -347,6 +356,7 @@ struct WTexture : AbstractGraphicsApi::Texture {
   uint32_t          mips   = 1;
   bool              is3D   = false;
   uint64_t          uid    = 0;
+  bool              bound  = false; // used by a recorded render pass command
   // key: mip (0xFFFF = all) | dim<<16
   std::unordered_map<uint32_t, WGPUTextureView> views;
   // direct slots for all-mip views (looked up on every bind group build)
@@ -368,6 +378,8 @@ struct WTexture : AbstractGraphicsApi::Texture {
     }
 
   ~WTexture() override {
+    if(bound)
+      ++g.resGen;
     for(auto& v:views)
       wgpuTextureViewRelease(v.second);
     if(impl!=nullptr)
@@ -419,7 +431,9 @@ struct WTexture : AbstractGraphicsApi::Texture {
     }
   };
 
-struct WDescArray : AbstractGraphicsApi::DescArray {};
+struct WDescArray : AbstractGraphicsApi::DescArray {
+  ~WDescArray() { ++g.resGen; }
+  };
 
 // ------------------------------------------------------------------ shaders
 
@@ -475,6 +489,7 @@ void createModule(const std::shared_ptr<ModuleState>& state, const std::string& 
     auto* hold = static_cast<std::shared_ptr<ModuleState>*>(user);
     auto  st   = *hold;
     delete hold;
+    ++g.stateGen;
     if(type==WGPUErrorType_NoError || st->module==nullptr) {
       st->pending = false;
       return;
@@ -711,6 +726,8 @@ struct WPipeline : AbstractGraphicsApi::Pipeline {
   std::vector<Decl::ComponentType> decl;
   struct Inst { WGPURenderPipeline p = nullptr; std::shared_ptr<bool> bad; };
   std::unordered_map<std::string, Inst> inst;
+
+  ~WPipeline() { ++g.resGen; }
 
   IVec3  workGroupSize() const override { return IVec3(1,1,1); }
   size_t sizeofBuffer(size_t id, size_t arraylen) const override { return lay.lx.sizeofBuffer(id, arraylen); }
@@ -1091,6 +1108,56 @@ void reportMissing(const std::string& tag, uint32_t slot) {
 
 // -------------------------------------------------------- command buffer
 
+// push data slot allocated by a segment: payload at rawPush[at], len bytes
+struct PushSlot {
+  uint32_t chunk = 0, off = 0, sz = 0, len = 0, at = 0;
+  };
+
+// command buffer state at the start of a render pass segment
+struct SegStart {
+  Detail::Bindings                 bind;
+  AbstractGraphicsApi::Pipeline*   gp = nullptr;
+  uint8_t                          push[256] = {};
+  size_t                           pushSize = 0;
+  size_t                           chunk = 0, used = 0;
+
+  bool operator==(const SegStart& o) const {
+    // push data is not compared: it only fills the slots, the ops never depend on it
+    return gp==o.gp && chunk==o.chunk && used==o.used &&
+           std::memcmp(&bind, &o.bind, sizeof(bind))==0;
+    }
+  };
+
+uint32_t packSampler(const Sampler& s) {
+  return uint32_t(s.minFilter) | uint32_t(s.magFilter)<<2 | uint32_t(s.mipFilter)<<4 |
+         uint32_t(s.uClamp)<<6 | uint32_t(s.vClamp)<<9 | uint32_t(s.wClamp)<<12 | uint32_t(s.anisotropic)<<15;
+  }
+
+Sampler unpackSampler(uint32_t v) {
+  Sampler s;
+  s.minFilter   = Filter(v & 3);
+  s.magFilter   = Filter((v>>2) & 3);
+  s.mipFilter   = Filter((v>>4) & 3);
+  s.uClamp      = ClampMode((v>>6) & 7);
+  s.vClamp      = ClampMode((v>>9) & 7);
+  s.wClamp      = ClampMode((v>>12) & 7);
+  s.anisotropic = ((v>>15) & 1)!=0;
+  return s;
+  }
+
+uint32_t packMapping(const ComponentMapping& m) {
+  return uint32_t(m.r) | uint32_t(m.g)<<8 | uint32_t(m.b)<<16 | uint32_t(m.a)<<24;
+  }
+
+ComponentMapping unpackMapping(uint32_t v) {
+  ComponentMapping m;
+  m.r = ComponentSwizzle(v & 0xFF);
+  m.g = ComponentSwizzle((v>>8) & 0xFF);
+  m.b = ComponentSwizzle((v>>16) & 0xFF);
+  m.a = ComponentSwizzle((v>>24) & 0xFF);
+  return m;
+  }
+
 struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   enum State : uint8_t { Idle, Render, Compute };
 
@@ -1128,11 +1195,41 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     uint32_t          epoch  = 0;
     uint32_t          repeat = 0;
     WGPURenderBundle  bundle = nullptr;
+    // how the ops were produced: the engine calls and the state they started from
+    SegStart          start;
+    std::vector<uint32_t> raw;
+    std::vector<PushSlot> slots;
+    std::vector<size_t>   used; // push chunk fill after the segment, from start.chunk on
+    uint32_t          resGen = 0, stateGen = 0;
+    bool              stable = false;
     };
   static constexpr size_t   MinBundleOps = 32;
   std::vector<Op>           seg;
   std::vector<Segment>      segCache;
   size_t                    segId = 0;
+
+  // Speculative segments. Producing the ops (bind group lookups, push data
+  // slots) costs far more than the engine calls themselves. When a cached
+  // segment starts from the same state as last time, the calls are only
+  // logged; if the log ends up identical to the one that produced the cached
+  // ops, the same ops would be produced again and the bundle is executed
+  // directly. Otherwise the state is rewound and the log is run for real.
+  // Push data is kept apart from the call log (it changes every frame, the
+  // ops do not depend on it): a replayed segment copies the current payloads
+  // into the same slots the recording allocated. Long segments are cut every
+  // SubSegDraws draws, so a change (an animated texture switching frames)
+  // invalidates only the piece it is in.
+  enum RawCall : uint32_t { R_Pso = 1, R_CPso, R_Push, R_Tex, R_Buf, R_Arr, R_Smp, R_Draw, R_DrawIdx, R_DrawInd };
+  static constexpr uint32_t SubSegDraws = 64;
+  std::vector<uint32_t>     raw, rawTmp;
+  std::vector<uint8_t>      rawPush, rawPushTmp;
+  size_t                    pushAt   = 0;  // current push data in rawPush
+  std::vector<PushSlot>     slots;
+  SegStart                  start;
+  uint32_t                  segDraws  = 0;
+  bool                      spec      = false;
+  bool                      replaying = false;
+  bool                      segSkip   = false; // a draw was skipped: result may change once shaders are ready
 
   WPipeline*                gp = nullptr;
   WCompPipeline*            cpso = nullptr;
@@ -1182,6 +1279,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     segId     = 0;
     for(auto& c:chunks)
       c.used = 0;
+    spec = false;
+    raw.clear();
     }
 
   void end() override {
@@ -1230,7 +1329,9 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       flushSegment();
       wgpuRenderPassEncoderEnd(rp);
       wgpuRenderPassEncoderRelease(rp);
-      rp = nullptr;
+      rp   = nullptr;
+      spec = false;
+      raw.clear();
       }
     if(cp!=nullptr) {
       wgpuComputePassEncoderEnd(cp);
@@ -1335,6 +1436,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     passW = w;
     passH = h;
     resetEncoderState();
+    beginSegment();
     }
 
   void endRendering() override {
@@ -1354,12 +1456,16 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
 
   // ------------------------------------------------------------ state
   void setPipeline(AbstractGraphicsApi::Pipeline& p) override {
+    if(rp!=nullptr)
+      raw.insert(raw.end(), {R_Pso, uint32_t(uintptr_t(&p))});
     gp = static_cast<WPipeline*>(&p);
     bindDirty = true;
     pushDirty = true;
     }
 
   void setComputePipeline(AbstractGraphicsApi::CompPipeline& p) override {
+    if(rp!=nullptr)
+      raw.insert(raw.end(), {R_CPso, uint32_t(uintptr_t(&p))});
     cpso = static_cast<WCompPipeline*>(&p);
     bindDirty = true;
     pushDirty = true;
@@ -1367,6 +1473,11 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
 
   void setPushData(const void* data, size_t size) override {
     size = std::min(size, sizeof(push));
+    if(rp!=nullptr) {
+      raw.insert(raw.end(), {R_Push, uint32_t(size)});
+      pushAt = rawPush.size();
+      rawPush.insert(rawPush.end(), reinterpret_cast<const uint8_t*>(data), reinterpret_cast<const uint8_t*>(data)+size);
+      }
     std::memcpy(push, data, size);
     pushSize  = size;
     pushDirty = true;
@@ -1378,6 +1489,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     if(bind.data[id]==tex && bind.offset[id]==mipLevel && bind.smp[id]==smp &&
        bind.map[id]==m && (bind.array & (1u<<id))==0)
       return;
+    if(rp!=nullptr)
+      raw.insert(raw.end(), {R_Tex, uint32_t(id), uint32_t(uintptr_t(tex)), mipLevel, packSampler(smp), packMapping(m)});
     bind.data  [id] = tex;
     bind.smp   [id] = smp;
     bind.map   [id] = m;
@@ -1389,6 +1502,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   void setBinding(size_t id, AbstractGraphicsApi::Buffer* buf, size_t offset) override {
     if(bind.data[id]==buf && bind.offset[id]==uint32_t(offset) && (bind.array & (1u<<id))==0)
       return;
+    if(rp!=nullptr)
+      raw.insert(raw.end(), {R_Buf, uint32_t(id), uint32_t(uintptr_t(buf)), uint32_t(offset)});
     bind.data  [id] = buf;
     bind.offset[id] = uint32_t(offset);
     bind.array &= ~(1u<<id);
@@ -1398,6 +1513,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   void setBinding(size_t id, AbstractGraphicsApi::DescArray* arr) override {
     if(bind.data[id]==arr && (bind.array & (1u<<id))!=0)
       return;
+    if(rp!=nullptr)
+      raw.insert(raw.end(), {R_Arr, uint32_t(id), uint32_t(uintptr_t(arr))});
     bind.data[id] = arr;
     bind.array |= (1u<<id);
     bindDirty = true;
@@ -1408,6 +1525,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
   void setBinding(size_t id, const Sampler& smp) override {
     if(bind.smp[id]==smp)
       return;
+    if(rp!=nullptr)
+      raw.insert(raw.end(), {R_Smp, uint32_t(id), packSampler(smp)});
     bind.smp[id] = smp;
     bindDirty = true;
     }
@@ -1475,6 +1594,9 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     auto& c = chunks[chunkId];
     std::memset(c.cpu.data()+c.used, 0, sz);
     std::memcpy(c.cpu.data()+c.used, push, std::min<size_t>(pushSize, lay.pb.size));
+    if(rp!=nullptr)
+      slots.push_back({uint32_t(chunkId), uint32_t(c.used), uint32_t(sz),
+                       uint32_t(std::min<size_t>(pushSize, lay.pb.size)), uint32_t(pushAt)});
     pushOffset = uint32_t(c.used);
     pushBufCur = c.buf;
     c.used += sz;
@@ -1549,6 +1671,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
           x.buffer = b->impl;
           x.offset = off;
           x.size   = sz;
+          b->bound |= (rp!=nullptr);
           key.push_back(b->uid | (off<<32));
           e.push_back(x);
           break;
@@ -1562,6 +1685,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
             }
           uint32_t mip = bind.offset[i];
           x.textureView = t->view(mip, lay.res[i].dim);
+          t->bound |= (rp!=nullptr);
           key.push_back(t->uid | (uint64_t(mip & 0xFFFF)<<32) | (uint64_t(lay.res[i].dim)<<48));
           e.push_back(x);
           if(cls==ShaderReflection::Texture) {
@@ -1589,6 +1713,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
             }
           uint32_t mip = bind.offset[i]==uint32_t(-1) ? 0 : bind.offset[i];
           x.textureView = t->view(mip, lay.res[i].dim);
+          t->bound |= (rp!=nullptr);
           key.push_back(t->uid | (uint64_t(mip & 0xFFFF)<<32) | (uint64_t(lay.res[i].dim)<<48));
           e.push_back(x);
           break;
@@ -1633,6 +1758,7 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
        gp->vs->pending() || (gp->fs!=nullptr && gp->fs->pending()) ||
        gp->vs->module()==nullptr || (gp->fs!=nullptr && gp->fs->module()==nullptr)) {
       ++g.st.skipped;
+      segSkip = true;
       return false;
       }
     if(!gp->reported) {
@@ -1643,16 +1769,20 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     const uint32_t variant = variantFor(lay);
     auto layouts  = lay.get(variant);
     auto pso      = gp->instance(variant, passColor, passColorCnt, passDepth, stride);
-    if(pso==nullptr)
+    if(pso==nullptr) {
+      segSkip = true;
       return false;
+      }
     if(lastPso!=pso) {
       record(OpPipeline, uint32_t(uintptr_t(pso)));
       lastPso = pso;
       }
     const uint32_t off = pushOffsetFor(lay);
     auto bg = cachedBindGroup(lay, variant, layouts.first, gp->vs->name);
-    if(bg==nullptr)
+    if(bg==nullptr) {
+      segSkip = true;
       return false;
+      }
     if(bg!=lastBg || (lay.pb.size>0 && off!=lastPushOff)) {
       record(OpBindGroup, uint32_t(uintptr_t(bg)), lay.pb.size>0 ? 1 : 0, off);
       lastBg      = bg;
@@ -1693,9 +1823,10 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     }
 
   void bindVbo(const AbstractGraphicsApi::Buffer* vbo) {
-    auto* b = static_cast<const WBuffer*>(vbo);
+    auto* b = const_cast<WBuffer*>(static_cast<const WBuffer*>(vbo));
     if(b==nullptr || b==lastVbo)
       return;
+    b->bound = true;
     record(OpVbo, uint32_t(uintptr_t(b->impl)), 0, 0, 0, 0, b->alloc);
     lastVbo = b;
     }
@@ -1781,10 +1912,151 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     return bundle;
     }
 
+  // state every segment starts from: no bind group or push slot carried over,
+  // so the ops of a segment depend only on its start state and its calls
+  void beginSegment() {
+    raw.clear();
+    spec      = false;
+    segSkip   = false;
+    bindDirty = true;
+    pushDirty = true;
+    bgLast    = nullptr;
+    varLay    = nullptr;
+    rawPush.clear();
+    slots.clear();
+    segDraws = 0;
+    pushAt   = 0;
+    if(rp==nullptr)
+      return;
+    rawPush.assign(push, push+pushSize);
+    start.bind     = bind;
+    start.gp       = gp;
+    std::memcpy(start.push, push, pushSize);
+    start.pushSize = pushSize;
+    start.chunk    = chunkId;
+    start.used     = chunks.empty() ? 0 : chunks[chunkId].used;
+    if(segId>=segCache.size() || (g.dbg & 4))
+      return;
+    auto& sg = segCache[segId];
+    spec = sg.stable && sg.bundle!=nullptr && sg.epoch==g_bindGroupEpoch &&
+           sg.resGen==g.resGen && sg.stateGen==g.stateGen &&
+           sg.colorCnt==passColorCnt && sg.depth==passDepth &&
+           sg.depthRO==passDepthRO && sg.stencilRO==passStencilRO &&
+           std::equal(passColor, passColor+passColorCnt, sg.color) &&
+           sg.start==start;
+    }
+
+  void runRaw(const std::vector<uint32_t>& r, const std::vector<uint8_t>& payload) {
+    using A = AbstractGraphicsApi;
+    size_t pc = start.pushSize;
+    replaying = true;
+    for(size_t i=0; i<r.size();) {
+      const uint32_t* w = r.data()+i;
+      switch(w[0]) {
+        case R_Pso:
+          setPipeline(*reinterpret_cast<A::Pipeline*>(uintptr_t(w[1])));
+          i += 2;
+          break;
+        case R_CPso:
+          setComputePipeline(*reinterpret_cast<A::CompPipeline*>(uintptr_t(w[1])));
+          i += 2;
+          break;
+        case R_Push:
+          setPushData(payload.data()+pc, w[1]);
+          pc += w[1];
+          i  += 2;
+          break;
+        case R_Tex:
+          setBinding(w[1], reinterpret_cast<A::Texture*>(uintptr_t(w[2])), w[3], unpackMapping(w[5]), unpackSampler(w[4]));
+          i += 6;
+          break;
+        case R_Buf:
+          setBinding(w[1], reinterpret_cast<A::Buffer*>(uintptr_t(w[2])), w[3]);
+          i += 4;
+          break;
+        case R_Arr:
+          setBinding(w[1], reinterpret_cast<A::DescArray*>(uintptr_t(w[2])));
+          i += 3;
+          break;
+        case R_Smp:
+          setBinding(w[1], unpackSampler(w[2]));
+          i += 3;
+          break;
+        case R_Draw:
+          draw(reinterpret_cast<const A::Buffer*>(uintptr_t(w[1])), w[2], w[3], w[4], w[5], w[6]);
+          i += 7;
+          break;
+        case R_DrawIdx:
+          drawIndexed(reinterpret_cast<const A::Buffer*>(uintptr_t(w[1])), w[2], w[3],
+                      *reinterpret_cast<const A::Buffer*>(uintptr_t(w[4])), Detail::IndexClass(w[5]),
+                      w[6], w[7], w[8], w[9]);
+          i += 10;
+          break;
+        case R_DrawInd:
+          drawIndirect(*reinterpret_cast<const A::Buffer*>(uintptr_t(w[1])), w[2]);
+          i += 3;
+          break;
+        default:
+          i = r.size();
+          break;
+        }
+      }
+    replaying = false;
+    }
+
   // emits the recorded commands of the current segment into the pass
   void flushSegment() {
+    if(spec) {
+      spec = false;
+      auto& sg = segCache[segId];
+      if(raw.size()==sg.raw.size() && std::memcmp(raw.data(), sg.raw.data(), raw.size()*sizeof(uint32_t))==0) {
+        // same start, same calls: the cached ops are what recording would produce
+        ++segId;
+        ++g.st.specHit;
+        ++g.st.bundles;
+        wgpuRenderPassEncoderExecuteBundles(rp, 1, &sg.bundle);
+        for(auto& sl:sg.slots) {
+          auto* dst = chunks[sl.chunk].cpu.data()+sl.off;
+          std::memset(dst, 0, sl.sz);
+          std::memcpy(dst, rawPush.data()+sl.at, sl.len);
+          }
+        for(size_t i=0; i<sg.used.size(); ++i)
+          chunks[sg.start.chunk+i].used = sg.used[i];
+        if(!sg.used.empty())
+          chunkId = sg.start.chunk + sg.used.size() - 1;
+        resetEncoderState();
+        beginSegment();
+        return;
+        }
+      // rewind to the segment start and run the calls for real
+      ++g.st.specMiss;
+      if(g.dbg & 8) {
+        size_t i = 0;
+        while(i<raw.size() && i<sg.raw.size() && raw[i]==sg.raw[i])
+          ++i;
+        Log::i("[WebGPU] spec miss seg=", segId, " size=", raw.size(), "/", sg.raw.size(), " at=", i,
+               " now=", i<raw.size() ? raw[i] : 0, " was=", i<sg.raw.size() ? sg.raw[i] : 0,
+               " ctx=", i>=1 ? raw[i-1] : 0, ",", i>=2 ? raw[i-2] : 0, ",", i>=3 ? raw[i-3] : 0, ",", i>=4 ? raw[i-4] : 0);
+        }
+      gp       = static_cast<WPipeline*>(start.gp);
+      bind     = start.bind;
+      std::memcpy(push, start.push, start.pushSize);
+      pushSize = start.pushSize;
+      bindDirty = true;
+      pushDirty = true;
+      bgLast    = nullptr;
+      varLay    = nullptr;
+      rawTmp.swap(raw);
+      raw.clear();
+      rawPushTmp.swap(rawPush);
+      rawPush.assign(push, push+pushSize);
+      slots.clear();
+      pushAt = 0;
+      runRaw(rawTmp, rawPushTmp);
+      }
     if(rp==nullptr || seg.empty()) {
       seg.clear();
+      beginSegment();
       return;
       }
     if(seg.size()<MinBundleOps || (g.dbg & 4)) {
@@ -1818,11 +2090,21 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
         std::copy(passColor, passColor+passColorCnt, sg.color);
         sg.ops.swap(seg);
         }
+      sg.start    = start;
+      sg.raw.swap(raw);
+      sg.slots.swap(slots);
+      sg.used.clear();
+      for(size_t i=start.chunk; i<chunks.size() && i<=chunkId; ++i)
+        sg.used.push_back(chunks[i].used);
+      sg.resGen   = g.resGen;
+      sg.stateGen = g.stateGen;
+      sg.stable   = !segSkip;
       }
     seg.clear();
     // executeBundles resets pipeline/bind group/buffers: the next segment
     // sets everything it uses
     resetEncoderState();
+    beginSegment();
     }
 
   // ------------------------------------------------------------ draws
@@ -1830,11 +2112,12 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
             size_t vertexCount, size_t firstInstance, size_t instanceCount) override {
     if(vertexCount==0 || instanceCount==0)
       return;
-    if(!flushGraphics(vbo ? stride : 0))
-      return;
-    if(vbo!=nullptr && !gp->decl.empty())
-      bindVbo(vbo);
-    record(OpDraw, uint32_t(vertexCount), uint32_t(instanceCount), uint32_t(offset), uint32_t(firstInstance));
+    if(rp!=nullptr)
+      raw.insert(raw.end(), {R_Draw, uint32_t(uintptr_t(vbo)), uint32_t(stride), uint32_t(offset),
+                             uint32_t(vertexCount), uint32_t(firstInstance), uint32_t(instanceCount)});
+    if(!spec)
+      implDraw(vbo, stride, offset, vertexCount, firstInstance, instanceCount);
+    endDraw();
     }
 
   void drawIndexed(const AbstractGraphicsApi::Buffer* vbo, size_t stride, size_t voffset,
@@ -1842,11 +2125,47 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
                    size_t isize, size_t firstInstance, size_t instanceCount) override {
     if(isize==0 || instanceCount==0)
       return;
+    if(rp!=nullptr)
+      raw.insert(raw.end(), {R_DrawIdx, uint32_t(uintptr_t(vbo)), uint32_t(stride), uint32_t(voffset),
+                             uint32_t(uintptr_t(&ibo)), uint32_t(cls), uint32_t(ioffset), uint32_t(isize),
+                             uint32_t(firstInstance), uint32_t(instanceCount)});
+    if(!spec)
+      implDrawIndexed(vbo, stride, voffset, ibo, cls, ioffset, isize, firstInstance, instanceCount);
+    endDraw();
+    }
+
+  void drawIndirect(const AbstractGraphicsApi::Buffer& indirect, size_t offset) override {
+    if(rp!=nullptr)
+      raw.insert(raw.end(), {R_DrawInd, uint32_t(uintptr_t(&indirect)), uint32_t(offset)});
+    if(!spec)
+      implDrawIndirect(indirect, offset);
+    endDraw();
+    }
+
+  // cuts long segments at fixed draw counts (the same points in every frame)
+  void endDraw() {
+    if(rp!=nullptr && !replaying && ++segDraws>=SubSegDraws)
+      flushSegment();
+    }
+
+  void implDraw(const AbstractGraphicsApi::Buffer* vbo, size_t stride, size_t offset,
+                size_t vertexCount, size_t firstInstance, size_t instanceCount) {
     if(!flushGraphics(vbo ? stride : 0))
       return;
     if(vbo!=nullptr && !gp->decl.empty())
       bindVbo(vbo);
-    auto& ib = static_cast<const WBuffer&>(ibo);
+    record(OpDraw, uint32_t(vertexCount), uint32_t(instanceCount), uint32_t(offset), uint32_t(firstInstance));
+    }
+
+  void implDrawIndexed(const AbstractGraphicsApi::Buffer* vbo, size_t stride, size_t voffset,
+                       const AbstractGraphicsApi::Buffer& ibo, Detail::IndexClass cls, size_t ioffset,
+                       size_t isize, size_t firstInstance, size_t instanceCount) {
+    if(!flushGraphics(vbo ? stride : 0))
+      return;
+    if(vbo!=nullptr && !gp->decl.empty())
+      bindVbo(vbo);
+    auto& ib = const_cast<WBuffer&>(static_cast<const WBuffer&>(ibo));
+    ib.bound = true;
     if(lastIbo!=&ib) {
       record(OpIbo, uint32_t(uintptr_t(ib.impl)),
              cls==Detail::IndexClass::i32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16, 0, 0, 0, ib.alloc);
@@ -1856,10 +2175,11 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
            uint32_t(int32_t(voffset)), uint32_t(firstInstance));
     }
 
-  void drawIndirect(const AbstractGraphicsApi::Buffer& indirect, size_t offset) override {
+  void implDrawIndirect(const AbstractGraphicsApi::Buffer& indirect, size_t offset) {
     if(!flushGraphics(0))
       return;
-    auto& b = static_cast<const WBuffer&>(indirect);
+    auto& b = const_cast<WBuffer&>(static_cast<const WBuffer&>(indirect));
+    b.bound = true;
     record(OpDrawIndirect, uint32_t(uintptr_t(b.impl)), 0, 0, 0, 0, offset);
     }
 
@@ -2280,7 +2600,8 @@ void WebGapi::present(Device*, Swapchain* sw) {
   if(g.frame<=3 || g.frame%300==0) {
     Log::i("[WebGPU] frame ", g.frame, ": passes=", g.st.passes, " screen=", g.st.screenPasses,
            " draws=", g.st.draws, " skipped=", g.st.skipped, " dispatch=", g.st.dispatches,
-           " submits=", g.st.submits, " bg=", g.st.bgLookups, "/", g.st.bgCreated, " bundles=", g.st.bundles, " errors=", g.errors);
+           " submits=", g.st.submits, " bg=", g.st.bgLookups, "/", g.st.bgCreated, " bundles=", g.st.bundles,
+           " spec=", g.st.specHit, "/", g.st.specMiss, " resGen=", g.resGen, " errors=", g.errors);
     }
   g.st = Ctx::Stats();
   g.dbg = EM_ASM_INT({ window.__ogFrame = $0; return (typeof window.__OG_GAPI_DEBUG === 'number') ? window.__OG_GAPI_DEBUG : 0; }, g.frame);
