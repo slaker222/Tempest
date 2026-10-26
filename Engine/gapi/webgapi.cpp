@@ -1288,14 +1288,22 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     // bytes changed since the last upload: slots mostly hold the same data
     // as in the previous frame, only changed ranges are written to the GPU
     size_t               dirtyB = PushChunk, dirtyE = 0;
+    // shape of the slot last written at each PushAlign block: when it is the
+    // same, the zero tail is still in place and only the data is compared
+    struct Shape { uint32_t sz = 0, len = 0; };
+    Shape                shape[PushChunk/PushAlign];
 
     void write(size_t off, size_t sz, const void* data, size_t len) {
-      static const uint8_t zero[PushAlign*4] = {};
       uint8_t* dst = cpu.data()+off;
-      if(sz<=sizeof(zero) && std::memcmp(dst, data, len)==0 && std::memcmp(dst+len, zero, sz-len)==0)
+      auto&    sh  = shape[off/PushAlign];
+      if(sh.sz==sz && sh.len==len && std::memcmp(dst, data, len)==0)
         return;
       std::memcpy(dst, data, len);
       std::memset(dst+len, 0, sz-len);
+      sh.sz  = uint32_t(sz);
+      sh.len = uint32_t(len);
+      for(size_t i=off/PushAlign+1; i<(off+sz)/PushAlign; ++i)
+        shape[i] = Shape();
       dirtyB = std::min(dirtyB, off);
       dirtyE = std::max(dirtyE, off+sz);
       }
