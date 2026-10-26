@@ -331,6 +331,9 @@ int WebApi::implExec(AppCallBack& cb) {
   // no simulated infinite loop: unwinding main() through wasm frames would
   // run destructors of the engine state; main() returns instead
   emscripten_set_main_loop(mainLoopIteration, 0, 0);
+  // ?uncapped: frames are not tied to the display refresh (benchmarking)
+  if(EM_ASM_INT({ return location.search.indexOf('uncapped')>=0 ? 1 : 0; }))
+    emscripten_set_main_loop_timing(EM_TIMING_SETIMMEDIATE, 1);
   return 0;
   }
 

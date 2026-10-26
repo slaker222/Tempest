@@ -229,9 +229,17 @@ WGPUSampler sampler(const Sampler& s, bool nonFiltering, bool comparison) {
   uint32_t key = uint32_t(minF) | uint32_t(magF)<<2 | uint32_t(mipF)<<4 |
                  uint32_t(s.uClamp)<<6 | uint32_t(s.vClamp)<<9 | uint32_t(s.wClamp)<<12 |
                  uint32_t(aniso)<<15 | uint32_t(comparison)<<16;
+  // the same few samplers are requested for every draw
+  static struct { uint32_t key = uint32_t(-1); WGPUSampler smp = nullptr; } memo[64];
+  auto& mm = memo[(key ^ (key>>6) ^ (key>>12)) & 63];
+  if(mm.key==key)
+    return mm.smp;
   auto it = g.samplers.find(key);
-  if(it!=g.samplers.end())
+  if(it!=g.samplers.end()) {
+    mm.key = key;
+    mm.smp = it->second;
     return it->second;
+    }
 
   WGPUSamplerDescriptor d = {};
   d.addressModeU  = addressMode(s.uClamp);
@@ -323,6 +331,8 @@ struct WTexture : AbstractGraphicsApi::Texture {
   uint64_t          uid    = 0;
   // key: mip (0xFFFF = all) | dim<<16
   std::unordered_map<uint32_t, WGPUTextureView> views;
+  // direct slots for all-mip views (looked up on every bind group build)
+  WGPUTextureView   allMips[8] = {};
 
   uint32_t mipCount() const override { return mips; }
 
@@ -348,6 +358,9 @@ struct WTexture : AbstractGraphicsApi::Texture {
   WGPUTextureView view(uint32_t mip, WGPUTextureViewDimension dim) {
     if(dim==WGPUTextureViewDimension_Undefined)
       dim = is3D ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2D;
+    const bool all = (mip==uint32_t(-1) && uint32_t(dim)<8);
+    if(all && allMips[dim]!=nullptr)
+      return allMips[dim];
     const uint32_t key = (mip==uint32_t(-1) ? 0xFFFFu : (mip & 0xFFFFu)) | (uint32_t(dim)<<16);
     auto it = views.find(key);
     if(it!=views.end())
@@ -362,6 +375,8 @@ struct WTexture : AbstractGraphicsApi::Texture {
     vd.aspect          = info.depth ? WGPUTextureAspect_DepthOnly : WGPUTextureAspect_All;
     auto v = wgpuTextureCreateView(impl, &vd);
     views[key] = v;
+    if(all)
+      allMips[dim] = v;
     return v;
     }
 
@@ -992,7 +1007,51 @@ struct KeyHash {
     return size_t(h ^ (h>>32));
     }
   };
-std::unordered_map<std::vector<uint64_t>, WGPUBindGroup, KeyHash> g_bindGroups;
+// open-addressing table: one probe sequence over a flat array, keys in an arena
+struct BindGroupCache {
+  struct Slot { uint64_t hash = 0; uint32_t keyOff = 0, keyLen = 0; WGPUBindGroup bg = nullptr; };
+  std::vector<Slot>     slots = std::vector<Slot>(32768);
+  std::vector<uint64_t> arena;
+  size_t                count = 0;
+
+  size_t size() const { return count; }
+
+  WGPUBindGroup find(const std::vector<uint64_t>& k, uint64_t h) const {
+    const size_t mask = slots.size()-1;
+    for(size_t i=size_t(h)&mask;; i=(i+1)&mask) {
+      auto& s = slots[i];
+      if(s.bg==nullptr)
+        return nullptr;
+      if(s.hash==h && s.keyLen==k.size() &&
+         std::memcmp(arena.data()+s.keyOff, k.data(), k.size()*sizeof(uint64_t))==0)
+        return s.bg;
+      }
+    }
+
+  void insert(const std::vector<uint64_t>& k, uint64_t h, WGPUBindGroup bg) {
+    const size_t mask = slots.size()-1;
+    size_t i = size_t(h)&mask;
+    while(slots[i].bg!=nullptr)
+      i = (i+1)&mask;
+    slots[i].hash   = h;
+    slots[i].keyOff = uint32_t(arena.size());
+    slots[i].keyLen = uint32_t(k.size());
+    slots[i].bg     = bg;
+    arena.insert(arena.end(), k.begin(), k.end());
+    ++count;
+    }
+
+  template<class F>
+  void clear(F release) {
+    for(auto& s:slots)
+      if(s.bg!=nullptr)
+        release(s.bg);
+    std::fill(slots.begin(), slots.end(), Slot());
+    arena.clear();
+    count = 0;
+    }
+  };
+BindGroupCache g_bindGroups;
 uint32_t g_bindGroupEpoch = 0;
 
 void reportFirstUse(const std::string& tag) {
@@ -1488,13 +1547,11 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
       e.push_back(x);
       }
 
-    auto it = g_bindGroups.find(key);
-    if(it!=g_bindGroups.end())
-      return it->second;
+    const uint64_t hash = KeyHash()(key);
+    if(auto found = g_bindGroups.find(key, hash))
+      return found;
     if(g_bindGroups.size()>16384) {
-      for(auto& i:g_bindGroups)
-        wgpuBindGroupRelease(i.second);
-      g_bindGroups.clear();
+      g_bindGroups.clear([](WGPUBindGroup bg){ wgpuBindGroupRelease(bg); });
       g_bindGroupEpoch++;
       }
     WGPUBindGroupDescriptor d = {};
@@ -1503,7 +1560,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     d.entries    = e.data();
     (void)tag;
     auto bg = wgpuDeviceCreateBindGroup(g.dev, &d);
-    g_bindGroups[key] = bg;
+    if(bg!=nullptr)
+      g_bindGroups.insert(key, hash, bg);
     return bg;
     }
 
