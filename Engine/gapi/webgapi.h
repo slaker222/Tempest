@@ -13,6 +13,10 @@ class WebGapi : public AbstractGraphicsApi {
 
     std::vector<Props> devices() const override;
 
+    // readPixels can only start the GPU readback in a browser (mapping is
+    // asynchronous): the image of the last readPixels call, once it arrived
+    static bool        takeReadback(Pixmap& out);
+
   protected:
     Device*        createDevice(std::string_view gpuName) override;
     Swapchain*     createSwapchain(SystemApi::Window* w, Device *d) override;

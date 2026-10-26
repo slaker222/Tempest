@@ -2636,14 +2636,84 @@ AbstractGraphicsApi::PTexture WebGapi::createStorage(Device*, uint32_t w, uint32
   return PTexture(t.release());
   }
 
-void WebGapi::readPixels(Device*, Pixmap& out, const PTexture, TextureFormat, uint32_t w, uint32_t h, uint32_t, bool) {
-  // synchronous GPU readback is impossible on the browser main thread
-  static bool warned = false;
-  if(!warned) {
-    warned = true;
-    Log::e("[WebGPU] readPixels is not supported; returning a blank image");
+namespace {
+// last readPixels request: the texture is copied into a mappable buffer, the
+// pixels arrive with the map callback (the browser event loop runs it)
+struct Readback {
+  WGPUBuffer           buf      = nullptr;
+  uint32_t             w = 0, h = 0, rowPitch = 0;
+  bool                 ready    = false;
+  bool                 failed   = false;
+  std::vector<uint8_t> px;
+  };
+std::shared_ptr<Readback> g_readback;
+}
+
+void WebGapi::readPixels(Device*, Pixmap& out, const PTexture t, TextureFormat frm, uint32_t w, uint32_t h, uint32_t mip, bool) {
+  w = std::max(1u, w);
+  h = std::max(1u, h);
+  out = Pixmap(w, h, TextureFormat::RGBA8);
+  auto* tex = static_cast<WTexture*>(t.handler);
+  if(tex==nullptr || (frm!=TextureFormat::RGBA8) || mip!=0) {
+    Log::e("[WebGPU] readPixels: only RGBA8 mip 0 is read back");
+    return;
     }
-  out = Pixmap(std::max(1u, w), std::max(1u, h), TextureFormat::RGBA8);
+  auto rb = std::make_shared<Readback>();
+  rb->w        = w;
+  rb->h        = h;
+  rb->rowPitch = alignUp(w*4u, 256u);
+
+  WGPUBufferDescriptor bd = {};
+  bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+  bd.size  = uint64_t(rb->rowPitch)*h;
+  rb->buf  = wgpuDeviceCreateBuffer(g.dev, &bd);
+
+  WGPUCommandEncoderDescriptor ed = {};
+  auto enc = wgpuDeviceCreateCommandEncoder(g.dev, &ed);
+  WGPUImageCopyTexture src = {};
+  src.texture  = tex->impl;
+  src.mipLevel = 0;
+  src.aspect   = WGPUTextureAspect_All;
+  WGPUImageCopyBuffer dst = {};
+  dst.buffer              = rb->buf;
+  dst.layout.bytesPerRow  = rb->rowPitch;
+  dst.layout.rowsPerImage = h;
+  WGPUExtent3D ext = {w, h, 1};
+  wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ext);
+  WGPUCommandBufferDescriptor cd = {};
+  auto cmd = wgpuCommandEncoderFinish(enc, &cd);
+  wgpuCommandEncoderRelease(enc);
+  wgpuQueueSubmit(g.queue, 1, &cmd);
+  wgpuCommandBufferRelease(cmd);
+
+  g_readback = rb;
+  auto* hold = new std::shared_ptr<Readback>(rb);
+  wgpuBufferMapAsync(rb->buf, WGPUMapMode_Read, 0, size_t(bd.size), [](WGPUBufferMapAsyncStatus st, void* user) {
+    std::unique_ptr<std::shared_ptr<Readback>> hold(static_cast<std::shared_ptr<Readback>*>(user));
+    auto& rb = **hold;
+    if(st!=WGPUBufferMapAsyncStatus_Success) {
+      rb.failed = true;
+      } else {
+      auto* src = static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(rb.buf, 0, size_t(rb.rowPitch)*rb.h));
+      rb.px.resize(size_t(rb.w)*rb.h*4);
+      for(uint32_t y=0; y<rb.h && src!=nullptr; ++y)
+        std::memcpy(rb.px.data()+size_t(y)*rb.w*4, src+size_t(y)*rb.rowPitch, size_t(rb.w)*4);
+      rb.ready = src!=nullptr;
+      wgpuBufferUnmap(rb.buf);
+      }
+    wgpuBufferRelease(rb.buf);
+    rb.buf = nullptr;
+    }, hold);
+  }
+
+bool WebGapi::takeReadback(Pixmap& out) {
+  auto rb = g_readback;
+  if(rb==nullptr || !rb->ready)
+    return false;
+  g_readback = nullptr;
+  out = Pixmap(rb->w, rb->h, TextureFormat::RGBA8);
+  std::memcpy(out.data(), rb->px.data(), rb->px.size());
+  return true;
   }
 
 void WebGapi::readBytes(Device*, Buffer* buf, void* out, size_t size) {
