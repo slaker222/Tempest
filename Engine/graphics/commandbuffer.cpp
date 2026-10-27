@@ -26,4 +26,6 @@ Encoder<CommandBuffer> CommandBuffer::startEncoding(Device& device) {
   }
 
 void CommandBuffer::collectGpuTimers() {
+  if(impl.handler!=nullptr)
+    impl.handler->collectGpuTimers();
   }

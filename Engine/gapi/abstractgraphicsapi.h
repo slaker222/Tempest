@@ -607,6 +607,8 @@ namespace Tempest {
         virtual void setViewport(const Rect& r)=0;
         virtual void setScissor (const Rect& r)=0;
         virtual void setDebugMarker(std::string_view tag);
+        // after the work of the buffer is done: reads the gpu timestamps taken at the debug markers
+        virtual void collectGpuTimers() {}
 
         // A caller that knows its commands repeat can ask for last frame's recording of them:
         // true when the same commands (token, gen) were recorded at this position before and

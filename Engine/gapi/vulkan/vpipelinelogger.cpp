@@ -54,6 +54,8 @@ struct Config {
   int safe_mode       = 0;
   int render_scale    = 100;
   int simple_render   = 0;
+  int draw_dist       = 0; // objects: 0 = no limit, 1..4 = 150/80/40/20 m
+  int world_dist_m    = 0; // everything: meters, 0 = no limit
   int freeze_time     = 0; // hour 1..24 to pin time-of-day for stable benchmarking; 0 = off
   bool loaded         = false;
 };
@@ -62,7 +64,11 @@ static Config s_config;
 static std::mutex s_logMutex;
 static std::atomic<uint32_t> s_pipelineSeq{1};
 
+static std::string s_gameDirOverride;
+
 static const char* findGameDir() {
+  if(!s_gameDirOverride.empty())
+    return s_gameDirOverride.c_str();
   const char* candidates[] = {
     "/storage/emulated/0/Gothic2",
     "/sdcard/Gothic2",
@@ -153,6 +159,8 @@ static void parseConfigFile(const char* cfgPath, time_t mtime) {
       else if(strcmp(k, "render_scale") == 0) s_config.render_scale = val;
       else if(strcmp(k, "simple_render") == 0) s_config.simple_render = val;
       else if(strcmp(k, "freeze_time") == 0) s_config.freeze_time = val;
+      else if(strcmp(k, "draw_dist") == 0) s_config.draw_dist = val;
+      else if(strcmp(k, "world_dist") == 0) s_config.world_dist_m = val;
       else if(strcmp(k, "force_hiz") == 0) s_config.force_hiz = val;
     }
   }
@@ -184,6 +192,12 @@ void opengothic_debug_check_reload() {
     }
   }
 }
+
+void opengothic_debug_set_game_dir(const char* dir) {
+  std::lock_guard<std::mutex> lock(s_logMutex);
+  if(dir!=nullptr)
+    s_gameDirOverride = dir;
+  }
 
 void opengothic_debug_init() {
   std::lock_guard<std::mutex> lock(s_logMutex);
@@ -293,6 +307,8 @@ int  opengothic_debug_spirv_noopt()     { if(!s_config.loaded) opengothic_debug_
 int  opengothic_debug_log_pipelines()   { if(!s_config.loaded) opengothic_debug_init(); return s_config.log_pipelines; }
 int  opengothic_debug_safe_mode()       { if(!s_config.loaded) opengothic_debug_init(); return s_config.safe_mode; }
 int  opengothic_debug_freeze_time()     { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.freeze_time; }
+int  opengothic_debug_draw_dist()     { if(!s_config.loaded) opengothic_debug_init(); return s_config.draw_dist; }
+int  opengothic_debug_world_dist()    { if(!s_config.loaded) opengothic_debug_init(); return s_config.world_dist_m; }
 int  opengothic_debug_force_hiz()       { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.force_hiz; }
 int  opengothic_debug_use_hiz_prepass() {
 #if defined(__ANDROID__) || defined(__EMSCRIPTEN__)

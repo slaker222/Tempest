@@ -326,6 +326,7 @@ class VDevice : public AbstractGraphicsApi::Device {
       uint32_t vendorID = 0;
 
       size_t   nonCoherentAtomSize = 0;
+      float    timestampPeriod     = 0; // ns per tick of a gpu timestamp
       size_t   bufferImageGranularity = 0;
       size_t   accelerationStructureScratchOffsetAlignment = 0;
 

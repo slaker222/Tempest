@@ -466,6 +466,7 @@ void VDevice::deviceProps(VkInstance instance, const bool hasDeviceFeatures2, Vk
   VkPhysicalDeviceProperties prop = {};
   vkGetPhysicalDeviceProperties(physicalDevice, &prop);
   props.nonCoherentAtomSize = size_t(prop.limits.nonCoherentAtomSize);
+  props.timestampPeriod     = prop.limits.timestampPeriod;
   if(props.nonCoherentAtomSize==0)
     props.nonCoherentAtomSize=1;
 

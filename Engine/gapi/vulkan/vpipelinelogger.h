@@ -7,6 +7,8 @@ extern "C" {
 #endif
 
 // Debug Configuration API
+// the folder of the game that runs: debug.cfg and the logs are kept there (default: the first Gothic2/Gothic folder found)
+void opengothic_debug_set_game_dir(const char* dir);
 void opengothic_debug_init();
 void opengothic_debug_check_reload();
 int  opengothic_debug_no_bindless();
@@ -24,6 +26,8 @@ int  opengothic_debug_prewarm();
 int  opengothic_debug_render_scale();
 int  opengothic_debug_simple_render();
 int  opengothic_debug_freeze_time();
+int  opengothic_debug_draw_dist();
+int  opengothic_debug_world_dist();
 // 1 = use full-scene HiZ depth prepass (desktop default); Android default 0 (prepass costs more than occlusion saves on Adreno)
 int  opengothic_debug_use_hiz_prepass();
 int  opengothic_debug_force_hiz();

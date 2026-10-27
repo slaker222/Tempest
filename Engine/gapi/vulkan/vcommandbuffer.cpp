@@ -14,6 +14,10 @@
 #include "vframebuffermap.h"
 #include "vaccelerationstructure.h"
 
+#include <Tempest/Log>
+#include <algorithm>
+#include <vector>
+
 using namespace Tempest;
 using namespace Tempest::Detail;
 
@@ -164,6 +168,8 @@ VCommandBuffer::VCommandBuffer(VDevice& device, VkCommandPoolCreateFlags flags)
   }
 
 VCommandBuffer::~VCommandBuffer() {
+  if(tsPool!=VK_NULL_HANDLE)
+    vkDestroyQueryPool(device.device.impl,tsPool,nullptr);
   if(impl!=nullptr) {
     vkFreeCommandBuffers(device.device.impl,pool.impl,1,&impl);
     }
@@ -225,6 +231,7 @@ void VCommandBuffer::begin(SyncHint hint) {
     beginInfo.pInheritanceInfo = nullptr;
     vkAssert(vkBeginCommandBuffer(impl,&beginInfo));
     }
+  tsBegin();
   }
 
 void VCommandBuffer::begin() {
@@ -232,6 +239,7 @@ void VCommandBuffer::begin() {
   }
 
 void VCommandBuffer::end() {
+  tsMark("end");
   if(isDbgRegion) {
     device.vkCmdDebugMarkerEnd(impl);
     isDbgRegion = false;
@@ -681,7 +689,72 @@ void VCommandBuffer::setScissor(const Rect& r) {
   vkCmdSetScissor(impl,0,1,&scissor);
   }
 
+void VCommandBuffer::tsBegin() {
+  tsCount = 0;
+  if(device.props.timestampPeriod<=0 || impl==nullptr)
+    return;
+  if(tsPool==VK_NULL_HANDLE) {
+    VkQueryPoolCreateInfo info = {};
+    info.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    info.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = MaxTimestamps;
+    if(vkCreateQueryPool(device.device.impl,&info,nullptr,&tsPool)!=VK_SUCCESS) {
+      tsPool = VK_NULL_HANDLE;
+      return;
+      }
+    }
+  vkCmdResetQueryPool(impl,tsPool,0,MaxTimestamps);
+  tsMark("start");
+  }
+
+void VCommandBuffer::tsMark(std::string_view tag) {
+  if(tsPool==VK_NULL_HANDLE || impl==nullptr || tsCount>=MaxTimestamps)
+    return;
+  vkCmdWriteTimestamp(impl,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,tsPool,tsCount);
+  tsTag[tsCount] = std::string(tag);
+  ++tsCount;
+  }
+
+void VCommandBuffer::collectGpuTimers() {
+  static uint32_t dbg = 0;
+  if(tsPool==VK_NULL_HANDLE || tsCount<2) {
+    if(++dbg%200==1)
+      Log::i("[GPU_PASS] skip: pool=",tsPool!=VK_NULL_HANDLE," count=",tsCount);
+    return;
+    }
+  uint64_t t[MaxTimestamps] = {};
+  auto res = vkGetQueryPoolResults(device.device.impl,tsPool,0,tsCount,sizeof(t),t,sizeof(uint64_t),
+                                   VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT);
+  if(res!=VK_SUCCESS) {
+    if(++dbg%200==1)
+      Log::i("[GPU_PASS] results: ",int(res)," count=",tsCount);
+    return;
+    }
+  // the section of a marker lasts until the next one
+  for(uint32_t i=0; i+1<tsCount; ++i)
+    tsSum[tsTag[i]] += double(t[i+1]-t[i])*double(device.props.timestampPeriod)*1e-6;
+  if(++tsFrames<180)
+    return;
+  std::vector<std::pair<std::string,double>> v(tsSum.begin(),tsSum.end());
+  std::sort(v.begin(),v.end(),[](auto& a, auto& b){ return a.second>b.second; });
+  std::string line = "[GPU_PASS] ms per frame:";
+  double total = 0;
+  for(auto& i:v)
+    total += i.second/tsFrames;
+  for(size_t i=0; i<v.size() && i<14; ++i) {
+    char buf[96];
+    std::snprintf(buf,sizeof(buf)," %s=%.2f",v[i].first.c_str(),v[i].second/tsFrames);
+    line += buf;
+    }
+  char buf[48];
+  std::snprintf(buf,sizeof(buf)," TOTAL=%.2f",total);
+  Log::i(line,buf);
+  tsSum.clear();
+  tsFrames = 0;
+  }
+
 void VCommandBuffer::setDebugMarker(std::string_view tag) {
+  tsMark(tag.empty() ? std::string_view("-") : tag);
   if(isDbgRegion) {
     device.vkCmdDebugMarkerEnd(impl);
     isDbgRegion = false;

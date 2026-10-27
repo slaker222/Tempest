@@ -1,6 +1,8 @@
 #pragma once
 
 #include <Tempest/AbstractGraphicsApi>
+#include <unordered_map>
+#include <string>
 #include "vulkan_sdk.h"
 
 #include "gapi/vulkan/vcommandpool.h"
@@ -54,6 +56,7 @@ class VCommandBuffer:public AbstractGraphicsApi::CommandBuffer {
     void setViewport(const Rect& r) override;
     void setScissor (const Rect& r) override;
     void setDebugMarker(std::string_view tag) override;
+    void collectGpuTimers() override;
 
     void setPipeline(AbstractGraphicsApi::Pipeline& p) override;
     void setComputePipeline(AbstractGraphicsApi::CompPipeline& p) override;
@@ -161,6 +164,16 @@ class VCommandBuffer:public AbstractGraphicsApi::CommandBuffer {
     VkPipelineLayout                        pipelineLayout  = VK_NULL_HANDLE;
 
     bool                                    isDbgRegion = false;
+
+    // gpu time of the marked sections: a timestamp at each debug marker, summed up and logged
+    static constexpr uint32_t               MaxTimestamps = 96;
+    VkQueryPool                             tsPool  = VK_NULL_HANDLE;
+    uint32_t                                tsCount = 0;
+    std::string                             tsTag[MaxTimestamps];
+    std::unordered_map<std::string,double>  tsSum;
+    uint32_t                                tsFrames = 0;
+    void                                    tsBegin();
+    void                                    tsMark(std::string_view tag);
   };
 
 }}
