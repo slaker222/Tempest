@@ -56,6 +56,11 @@ struct Config {
   int simple_render   = 0;
   int draw_dist       = 0; // objects: 0 = no limit, 1..4 = 150/80/40/20 m
   int world_dist_m    = 0; // everything: meters, 0 = no limit
+  int shadows         = 1; // android: 0 = off, 1 = 512, 2 = 1024, 3 = 2048
+  int ssao            = 0; // android: ambient occlusion (standard render only)
+  int reflections     = 0; // android: screen-space water reflections
+  int show_fps        = 1;
+  int fps_unlimited   = 0; // 1 = no game fps limit (zMaxFps)
   int freeze_time     = 0; // hour 1..24 to pin time-of-day for stable benchmarking; 0 = off
   bool loaded         = false;
 };
@@ -161,6 +166,11 @@ static void parseConfigFile(const char* cfgPath, time_t mtime) {
       else if(strcmp(k, "freeze_time") == 0) s_config.freeze_time = val;
       else if(strcmp(k, "draw_dist") == 0) s_config.draw_dist = val;
       else if(strcmp(k, "world_dist") == 0) s_config.world_dist_m = val;
+      else if(strcmp(k, "shadows") == 0) s_config.shadows = val;
+      else if(strcmp(k, "ssao") == 0) s_config.ssao = val;
+      else if(strcmp(k, "reflections") == 0) s_config.reflections = val;
+      else if(strcmp(k, "show_fps") == 0) s_config.show_fps = val;
+      else if(strcmp(k, "fps_unlimited") == 0) s_config.fps_unlimited = val;
       else if(strcmp(k, "force_hiz") == 0) s_config.force_hiz = val;
     }
   }
@@ -308,6 +318,11 @@ int  opengothic_debug_log_pipelines()   { if(!s_config.loaded) opengothic_debug_
 int  opengothic_debug_safe_mode()       { if(!s_config.loaded) opengothic_debug_init(); return s_config.safe_mode; }
 int  opengothic_debug_freeze_time()     { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.freeze_time; }
 int  opengothic_debug_draw_dist()     { if(!s_config.loaded) opengothic_debug_init(); return s_config.draw_dist; }
+int  opengothic_debug_shadows()      { if(!s_config.loaded) opengothic_debug_init(); return s_config.shadows; }
+int  opengothic_debug_ssao()         { if(!s_config.loaded) opengothic_debug_init(); return s_config.ssao; }
+int  opengothic_debug_reflections()  { if(!s_config.loaded) opengothic_debug_init(); return s_config.reflections; }
+int  opengothic_debug_show_fps()     { if(!s_config.loaded) opengothic_debug_init(); return s_config.show_fps; }
+int  opengothic_debug_fps_unlimited(){ if(!s_config.loaded) opengothic_debug_init(); return s_config.fps_unlimited; }
 int  opengothic_debug_world_dist()    { if(!s_config.loaded) opengothic_debug_init(); return s_config.world_dist_m; }
 int  opengothic_debug_force_hiz()       { if(!s_config.loaded) opengothic_debug_init(); else opengothic_debug_check_reload(); return s_config.force_hiz; }
 int  opengothic_debug_use_hiz_prepass() {

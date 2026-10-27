@@ -28,6 +28,11 @@ int  opengothic_debug_simple_render();
 int  opengothic_debug_freeze_time();
 int  opengothic_debug_draw_dist();
 int  opengothic_debug_world_dist();
+int  opengothic_debug_shadows();
+int  opengothic_debug_ssao();
+int  opengothic_debug_reflections();
+int  opengothic_debug_show_fps();
+int  opengothic_debug_fps_unlimited();
 // 1 = use full-scene HiZ depth prepass (desktop default); Android default 0 (prepass costs more than occlusion saves on Adreno)
 int  opengothic_debug_use_hiz_prepass();
 int  opengothic_debug_force_hiz();
