@@ -67,6 +67,12 @@ struct PixmapCodecPng::Impl {
       png_set_palette_to_rgb(png_ptr);
       outBpp = 3;
       frm    = TextureFormat::RGB8;
+      if(png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) {
+        // palette with transparency (reduced-colour pictures with alpha)
+        png_set_tRNS_to_alpha(png_ptr);
+        outBpp = 4;
+        frm    = TextureFormat::RGBA8;
+        }
       }
     else {
       return false;
