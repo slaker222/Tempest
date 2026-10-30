@@ -66,6 +66,7 @@ static Event::KeyType mapEmscriptenKey(const char* code) {
   if(std::strcmp(code, "Enter") == 0) return Event::K_Return;
   if(std::strcmp(code, "Backspace") == 0) return Event::K_Back;
   if(std::strcmp(code, "Tab") == 0) return Event::K_Tab;
+  if(std::strcmp(code, "CapsLock") == 0) return Event::K_CapsLock;
   if(std::strcmp(code, "ShiftLeft") == 0) return Event::K_LShift;
   if(std::strcmp(code, "ShiftRight") == 0) return Event::K_RShift;
   if(std::strcmp(code, "ControlLeft") == 0) return Event::K_LControl;

@@ -3,6 +3,8 @@
 #include "webdpr.h"
 #include "webgapi.h"
 
+#include <atomic>
+
 #include <Tempest/Log>
 #include <Tempest/Pixmap>
 #include <Tempest/Except>
@@ -353,6 +355,10 @@ struct WBuffer : AbstractGraphicsApi::Buffer {
     }
   };
 
+struct WTexture;
+static void unregisterChain(WTexture* t);
+static std::vector<WTexture*> g_chainTex; // compressed textures with a mip chain, see texture quality
+
 struct WTexture : AbstractGraphicsApi::Texture {
   WGPUTexture       impl   = nullptr;
   TextureFormat     frm    = TextureFormat::Undefined;
@@ -362,6 +368,9 @@ struct WTexture : AbstractGraphicsApi::Texture {
   bool              is3D   = false;
   uint64_t          uid    = 0;
   bool              bound  = false; // used by a recorded render pass command
+  // texture quality: a compressed texture with a mip chain is sampled starting from viewBase
+  bool              chain  = false;
+  uint32_t          fullW = 1, fullH = 1, viewBase = 0;
   // key: mip (0xFFFF = all) | dim<<16
   std::unordered_map<uint32_t, WGPUTextureView> views;
   // direct slots for all-mip views (looked up on every bind group build)
@@ -383,6 +392,8 @@ struct WTexture : AbstractGraphicsApi::Texture {
     }
 
   ~WTexture() override {
+    if(chain)
+      unregisterChain(this);
     if(bound)
       ++g.resGen;
     for(auto& v:views)
@@ -404,8 +415,8 @@ struct WTexture : AbstractGraphicsApi::Texture {
     WGPUTextureViewDescriptor vd = {};
     vd.format          = info.wgpu;
     vd.dimension       = dim;
-    vd.baseMipLevel    = (mip==uint32_t(-1)) ? 0 : mip;
-    vd.mipLevelCount   = (mip==uint32_t(-1)) ? mips : 1;
+    vd.baseMipLevel    = (mip==uint32_t(-1)) ? viewBase : mip;
+    vd.mipLevelCount   = (mip==uint32_t(-1)) ? mips-viewBase : 1;
     vd.baseArrayLayer  = 0;
     vd.arrayLayerCount = 1;
     vd.aspect          = info.depth ? WGPUTextureAspect_DepthOnly : WGPUTextureAspect_All;
@@ -435,6 +446,12 @@ struct WTexture : AbstractGraphicsApi::Texture {
     return v;
     }
   };
+
+static void unregisterChain(WTexture* t) {
+  auto it = std::find(g_chainTex.begin(), g_chainTex.end(), t);
+  if(it!=g_chainTex.end())
+    g_chainTex.erase(it);
+  }
 
 struct WDescArray : AbstractGraphicsApi::DescArray {
   ~WDescArray() { ++g.resGen; }
@@ -1759,7 +1776,8 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
           uint32_t mip = bind.offset[i];
           x.textureView = t->view(mip, lay.res[i].dim);
           t->bound |= (rp!=nullptr);
-          key.push_back(t->uid | (uint64_t(mip & 0xFFFF)<<32) | (uint64_t(lay.res[i].dim)<<48));
+          // viewBase: texture quality changes the view, the cached bind group must not be found
+          key.push_back(t->uid | (uint64_t(mip & 0xFFFF)<<32) | (uint64_t(lay.res[i].dim)<<48) | (uint64_t(t->viewBase)<<56));
           e.push_back(x);
           if(cls==ShaderReflection::Texture) {
             const bool unfilt = (variant & (1u<<i))!=0 || lay.res[i].sampleType!=WGPUTextureSampleType_Float;
@@ -2642,6 +2660,50 @@ static WGPUTextureUsageFlags textureUsage(const FormatInfo& info, bool storage) 
   return u;
   }
 
+// texture quality of the page: 1 = half size, 2 = quarter ... Compressed textures with a mip chain are
+// sampled starting from a lower mip level (views), both ways at any time
+static std::atomic<uint32_t> g_texSkipMips{0};
+
+// levels left out for a texture of the given full size; never below 32 px
+static uint32_t texSkipFor(uint32_t level, uint32_t fullW, uint32_t fullH, uint32_t totalMips) {
+  uint32_t skip = std::min(level, totalMips-1);
+  while(skip>0 && (std::min(fullW,fullH)>>skip)<32)
+    --skip;
+  return skip;
+  }
+
+extern "C" void tempest_web_set_tex_skip(int levels) {
+  const uint32_t lv = uint32_t(std::max(0, std::min(levels, 4)));
+  if(g_texSkipMips.exchange(lv)==lv)
+    return;
+  bool changed = false;
+  size_t cnt = 0;
+  for(auto* t:g_chainTex) {
+    const uint32_t base = texSkipFor(lv, t->fullW, t->fullH, t->mips);
+    if(base==t->viewBase)
+      continue;
+    t->viewBase = base;
+    for(auto it=t->views.begin(); it!=t->views.end();) {
+      if((it->first & 0xFFFFu)==0xFFFFu) {
+        wgpuTextureViewRelease(it->second);
+        it = t->views.erase(it);
+        } else {
+        ++it;
+        }
+      }
+    for(auto& v:t->allMips)
+      v = nullptr;
+    changed = true;
+    ++cnt;
+    }
+  Log::i("[WebGPU] texture quality ", lv, ": ", cnt, " of ", g_chainTex.size(), " textures resampled");
+  if(changed) {
+    ++g.resEpoch; // bind groups hold the old views
+    ++g.resGen;
+    ++g_bindGroupEpoch; // recorded passes and bundles bind groups with the old views
+    }
+  }
+
 AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, const Pixmap& p, TextureFormat frm, uint32_t mips) {
   ++g.resEpoch;
   std::unique_ptr<WTexture> t(new WTexture());
@@ -2659,6 +2721,17 @@ AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, const Pixmap& p, T
     t->info = formatInfo(TextureFormat::RGBA8);
   if(t->info.compressed && t->mips>p.mipCount())
     t->mips = p.mipCount();
+
+  // texture quality: every level is uploaded, so it can be raised again at any time; the top levels
+  // are only left out of the sampled view (user interface textures have no chain)
+  size_t skipOff = 0;
+  if(t->info.compressed && p.mipCount()>=4) {
+    t->chain    = true;
+    t->fullW    = t->w;
+    t->fullH    = t->h;
+    t->viewBase = texSkipFor(g_texSkipMips.load(), t->w, t->h, t->mips);
+    g_chainTex.push_back(t.get());
+    }
   t->create(textureUsage(t->info, false) & (t->info.compressed ? ~WGPUTextureUsageFlags(WGPUTextureUsage_RenderAttachment) : ~0u));
 
   const uint8_t* src = static_cast<const uint8_t*>(p.data());
@@ -2697,7 +2770,7 @@ AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, const Pixmap& p, T
 
   if(t->info.compressed) {
     uint32_t w = t->w, h = t->h;
-    size_t   off = 0;
+    size_t   off = skipOff;
     for(uint32_t m=0; m<t->mips; ++m) {
       const uint32_t bw = std::max(1u, (w+3)/4), bh = std::max(1u, (h+3)/4);
       const size_t   sz = size_t(bw)*bh*t->info.bpp;
