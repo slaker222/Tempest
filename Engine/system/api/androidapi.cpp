@@ -8,6 +8,8 @@
 #include <Tempest/Except>
 #include <android/native_window.h>
 #include <cmath>
+#include <algorithm>
+#include <atomic>
 #include <unistd.h>
 #include <cstring>
 #include <thread>
@@ -71,6 +73,26 @@ void AndroidApi::setNativeWindow(ANativeWindow* window) {
 
 void* AndroidApi::nativeWindow() {
   return currentNativeWindow;
+  }
+
+static std::atomic<float> screenDensity{0.f};
+
+void AndroidApi::setDensity(float density) {
+  screenDensity.store(density);
+  }
+
+float AndroidApi::implUiScale(SystemApi::Window* w) {
+  // Same rule as the browser version: the interface is laid out for 500+ dp high screens,
+  // a phone (some 400 dp high in landscape) gets it smaller (0.7..1 of a dp).
+  float density = screenDensity.load();
+  if(density <= 0.f)
+    return 1.f;
+  ANativeWindow* win = reinterpret_cast<ANativeWindow*>(w ? w : reinterpret_cast<SystemApi::Window*>(currentNativeWindow));
+  int32_t h = win ? ANativeWindow_getHeight(win) : 0;
+  if(h <= 0)
+    return density;
+  float dp = float(h) / density;
+  return density * std::clamp(dp / 500.f, 0.7f, 1.f);
   }
 
 void AndroidApi::notifySurfaceChanged(int width, int height) {

@@ -47,6 +47,7 @@ class AndroidApi final: public SystemApi {
     static void  setNativeWindow(ANativeWindow* window);
     static void* nativeWindow();
     static void  notifySurfaceChanged(int width, int height);
+    static void  setDensity(float density); // screen density (px per dp), for the interface scale
     static void  pushTouchEvent(int action, float x, float y, int id);
     static void  pushKeyEvent(int action, int keyCode);
     static void  setDeviceLostHandler(void (*fn)()); // the gpu driver lost the device (a hang): the app lowers its settings and ends
@@ -65,6 +66,7 @@ class AndroidApi final: public SystemApi {
     Rect     implWindowClientRect(SystemApi::Window *w) override;
     bool     implSetAsFullscreen(SystemApi::Window *w, bool fullScreen) override;
     bool     implIsFullscreen(SystemApi::Window *w) override;
+    float    implUiScale(SystemApi::Window *w) override;
 
     void     implSetCursorPosition(SystemApi::Window *w, int x, int y) override;
     void     implShowCursor(SystemApi::Window *w, CursorShape cursor) override;
