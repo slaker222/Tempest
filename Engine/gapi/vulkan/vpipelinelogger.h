@@ -20,6 +20,7 @@ int  opengothic_debug_skip_lights();
 int  opengothic_debug_skip_fog();
 int  opengothic_debug_skip_gbuf();
 int  opengothic_debug_skip_atest();
+int  opengothic_debug_no_cmd_cull();
 int  opengothic_debug_spirv_noopt();
 int  opengothic_debug_no_atest_depth();
 int  opengothic_debug_prewarm();

@@ -41,6 +41,7 @@ struct Config {
   int skip_fog        = 0;
   int skip_gbuf       = 0;
   int skip_atest      = 0;
+  int no_cmd_cull     = 0; // do not skip the draw commands that are wholly outside of the camera
   int spirv_noopt     = 0;
 #if defined(__ANDROID__)
   // solid-depth variants for alpha-test in shadow/depth passes: no discard FS, LRZ-friendly on Adreno
@@ -156,6 +157,7 @@ static void parseConfigFile(const char* cfgPath, time_t mtime) {
       else if(strcmp(k, "skip_fog") == 0) s_config.skip_fog = val;
       else if(strcmp(k, "skip_gbuf") == 0) s_config.skip_gbuf = val;
       else if(strcmp(k, "skip_atest") == 0) s_config.skip_atest = val;
+      else if(strcmp(k, "no_cmd_cull") == 0) s_config.no_cmd_cull = val;
       else if(strcmp(k, "no_atest_depth") == 0) s_config.no_atest_depth = val;
       else if(strcmp(k, "prewarm") == 0) s_config.prewarm = val;
       else if(strcmp(k, "spirv_noopt") == 0) s_config.spirv_noopt = val;
@@ -310,6 +312,7 @@ int  opengothic_debug_skip_shadows()    { if(!s_config.loaded) opengothic_debug_
 int  opengothic_debug_skip_lights()     { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_lights; }
 int  opengothic_debug_skip_fog()        { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_fog; }
 int  opengothic_debug_skip_gbuf()       { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_gbuf; }
+int  opengothic_debug_no_cmd_cull()    { if(!s_config.loaded) opengothic_debug_init(); return s_config.no_cmd_cull; }
 int  opengothic_debug_skip_atest()      { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_atest; }
 int  opengothic_debug_no_atest_depth()  { if(!s_config.loaded) opengothic_debug_init(); return s_config.no_atest_depth; }
 int  opengothic_debug_prewarm()         { if(!s_config.loaded) opengothic_debug_init(); return s_config.prewarm; }
