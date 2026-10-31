@@ -1,6 +1,7 @@
 #if defined(TEMPEST_BUILD_VULKAN)
 
 #include "vcommandbuffer.h"
+#include "vpipelinelogger.h"
 
 #include <Tempest/Attachment>
 
@@ -692,6 +693,8 @@ void VCommandBuffer::setScissor(const Rect& r) {
 void VCommandBuffer::tsBegin() {
   tsCount = 0;
   if(device.props.timestampPeriod<=0 || impl==nullptr)
+    return;
+  if(!opengothic_debug_gpu_timers())
     return;
   if(tsPool==VK_NULL_HANDLE) {
     VkQueryPoolCreateInfo info = {};

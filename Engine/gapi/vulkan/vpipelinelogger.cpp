@@ -42,6 +42,7 @@ struct Config {
   int skip_gbuf       = 0;
   int skip_atest      = 0;
   int always_stash    = 0; // copy the scene for water/glass even when nothing in the frame reads it
+  int gpu_timers      = 0; // timestamp queries between the passes: off by default, they cost ~2.7 FPS on the moto g84
   int no_cmd_cull     = 0; // do not skip the draw commands that are wholly outside of the camera
   int spirv_noopt     = 0;
 #if defined(__ANDROID__)
@@ -158,6 +159,7 @@ static void parseConfigFile(const char* cfgPath, time_t mtime) {
       else if(strcmp(k, "skip_fog") == 0) s_config.skip_fog = val;
       else if(strcmp(k, "skip_gbuf") == 0) s_config.skip_gbuf = val;
       else if(strcmp(k, "skip_atest") == 0) s_config.skip_atest = val;
+      else if(strcmp(k, "gpu_timers") == 0) s_config.gpu_timers = val;
       else if(strcmp(k, "no_cmd_cull") == 0) s_config.no_cmd_cull = val;
       else if(strcmp(k, "always_stash") == 0) s_config.always_stash = val;
       else if(strcmp(k, "no_atest_depth") == 0) s_config.no_atest_depth = val;
@@ -315,6 +317,7 @@ int  opengothic_debug_skip_lights()     { if(!s_config.loaded) opengothic_debug_
 int  opengothic_debug_skip_fog()        { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_fog; }
 int  opengothic_debug_skip_gbuf()       { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_gbuf; }
 int  opengothic_debug_always_stash()   { if(!s_config.loaded) opengothic_debug_init(); return s_config.always_stash; }
+int  opengothic_debug_gpu_timers()  { if(!s_config.loaded) opengothic_debug_init(); return s_config.gpu_timers; }
 int  opengothic_debug_no_cmd_cull()    { if(!s_config.loaded) opengothic_debug_init(); return s_config.no_cmd_cull; }
 int  opengothic_debug_skip_atest()      { if(!s_config.loaded) opengothic_debug_init(); return s_config.skip_atest; }
 int  opengothic_debug_no_atest_depth()  { if(!s_config.loaded) opengothic_debug_init(); return s_config.no_atest_depth; }
