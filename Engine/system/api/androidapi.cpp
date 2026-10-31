@@ -5,8 +5,10 @@
 #include <Tempest/Window>
 #include <Tempest/Application>
 #include <Tempest/Log>
+#include <Tempest/Except>
 #include <android/native_window.h>
 #include <cmath>
+#include <unistd.h>
 #include <cstring>
 #include <thread>
 #include <chrono>
@@ -229,6 +231,12 @@ bool AndroidApi::implIsRunning() {
   return !isExit.load();
   }
 
+static void (*g_deviceLost)() = nullptr;
+
+void AndroidApi::setDeviceLostHandler(void (*fn)()) {
+  g_deviceLost = fn;
+  }
+
 int AndroidApi::implExec(AppCallBack& cb) {
   Log::i("AndroidApi::implExec game render loop started");
   while(!isExit.load()) {
@@ -241,6 +249,14 @@ int AndroidApi::implExec(AppCallBack& cb) {
     if(currentOwner != nullptr && currentNativeWindow != nullptr) {
       try {
         SystemApi::dispatchRender(*currentOwner);
+        }
+      catch(const DeviceLostException& e) {
+        // nothing can be drawn after that: the driver reset the gpu (it is a hang, e.g. too much for a weak gpu)
+        Log::e("dispatchRender error: ", e.what());
+        if(g_deviceLost!=nullptr)
+          g_deviceLost();
+        // the destructors of the lost device throw again: the process ends here, the next start is a clean one
+        _exit(0);
         }
       catch(const std::exception& e) {
         Log::e("dispatchRender error: ", e.what());
