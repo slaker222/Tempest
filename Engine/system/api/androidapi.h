@@ -49,6 +49,7 @@ class AndroidApi final: public SystemApi {
     static void  notifySurfaceChanged(int width, int height);
     static void  pushTouchEvent(int action, float x, float y, int id);
     static void  pushKeyEvent(int action, int keyCode);
+    static void  pushWebKey(int action, const char* code); // 0 down, 1 up; code: KeyboardEvent.code of the web page's touch layer
     static void  pushMouseEvent(int action, int button, int x, int y);
 
   private:

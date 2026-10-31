@@ -7,6 +7,7 @@
 #include <Tempest/Log>
 #include <android/native_window.h>
 #include <cmath>
+#include <cstring>
 #include <thread>
 #include <chrono>
 
@@ -81,6 +82,81 @@ void AndroidApi::notifySurfaceChanged(int width, int height) {
 void AndroidApi::pushTouchEvent(int action, float x, float y, int id) {
   std::lock_guard<std::mutex> lk(eventSync);
   touchEvents.push_back({action, x, y, id});
+  }
+
+namespace {
+using namespace Tempest;
+static Event::KeyType mapWebKeyCode(const char* code) {
+  if(!code) return Event::K_NoKey;
+  if(std::strcmp(code, "KeyA") == 0) return Event::K_A;
+  if(std::strcmp(code, "KeyB") == 0) return Event::K_B;
+  if(std::strcmp(code, "KeyC") == 0) return Event::K_C;
+  if(std::strcmp(code, "KeyD") == 0) return Event::K_D;
+  if(std::strcmp(code, "KeyE") == 0) return Event::K_E;
+  if(std::strcmp(code, "KeyF") == 0) return Event::K_F;
+  if(std::strcmp(code, "KeyG") == 0) return Event::K_G;
+  if(std::strcmp(code, "KeyH") == 0) return Event::K_H;
+  if(std::strcmp(code, "KeyI") == 0) return Event::K_I;
+  if(std::strcmp(code, "KeyJ") == 0) return Event::K_J;
+  if(std::strcmp(code, "KeyK") == 0) return Event::K_K;
+  if(std::strcmp(code, "KeyL") == 0) return Event::K_L;
+  if(std::strcmp(code, "KeyM") == 0) return Event::K_M;
+  if(std::strcmp(code, "KeyN") == 0) return Event::K_N;
+  if(std::strcmp(code, "KeyO") == 0) return Event::K_O;
+  if(std::strcmp(code, "KeyP") == 0) return Event::K_P;
+  if(std::strcmp(code, "KeyQ") == 0) return Event::K_Q;
+  if(std::strcmp(code, "KeyR") == 0) return Event::K_R;
+  if(std::strcmp(code, "KeyS") == 0) return Event::K_S;
+  if(std::strcmp(code, "KeyT") == 0) return Event::K_T;
+  if(std::strcmp(code, "KeyU") == 0) return Event::K_U;
+  if(std::strcmp(code, "KeyV") == 0) return Event::K_V;
+  if(std::strcmp(code, "KeyW") == 0) return Event::K_W;
+  if(std::strcmp(code, "KeyX") == 0) return Event::K_X;
+  if(std::strcmp(code, "KeyY") == 0) return Event::K_Y;
+  if(std::strcmp(code, "KeyZ") == 0) return Event::K_Z;
+  if(std::strcmp(code, "Space") == 0) return Event::K_Space;
+  if(std::strcmp(code, "Escape") == 0) return Event::K_ESCAPE;
+  if(std::strcmp(code, "Enter") == 0) return Event::K_Return;
+  if(std::strcmp(code, "Backspace") == 0) return Event::K_Back;
+  if(std::strcmp(code, "Tab") == 0) return Event::K_Tab;
+  if(std::strcmp(code, "CapsLock") == 0) return Event::K_CapsLock;
+  if(std::strcmp(code, "ShiftLeft") == 0) return Event::K_LShift;
+  if(std::strcmp(code, "ShiftRight") == 0) return Event::K_RShift;
+  if(std::strcmp(code, "ControlLeft") == 0) return Event::K_LControl;
+  if(std::strcmp(code, "ControlRight") == 0) return Event::K_RControl;
+  if(std::strcmp(code, "AltLeft") == 0) return Event::K_LAlt;
+  if(std::strcmp(code, "AltRight") == 0) return Event::K_RAlt;
+  if(std::strcmp(code, "Delete") == 0) return Event::K_Delete;
+  if(std::strcmp(code, "Insert") == 0) return Event::K_Insert;
+  if(std::strcmp(code, "Home") == 0) return Event::K_Home;
+  if(std::strcmp(code, "End") == 0) return Event::K_End;
+  if(std::strncmp(code, "Digit", 5) == 0 && code[5]>='0' && code[5]<='9' && code[6]=='\0')
+    return Event::KeyType(Event::K_0 + (code[5]-'0'));
+  if(std::strcmp(code, "ArrowUp") == 0) return Event::K_Up;
+  if(std::strcmp(code, "ArrowDown") == 0) return Event::K_Down;
+  if(std::strcmp(code, "ArrowLeft") == 0) return Event::K_Left;
+  if(std::strcmp(code, "ArrowRight") == 0) return Event::K_Right;
+  if(std::strcmp(code, "F1") == 0) return Event::K_F1;
+  if(std::strcmp(code, "F2") == 0) return Event::K_F2;
+  if(std::strcmp(code, "F3") == 0) return Event::K_F3;
+  if(std::strcmp(code, "F4") == 0) return Event::K_F4;
+  if(std::strcmp(code, "F5") == 0) return Event::K_F5;
+  if(std::strcmp(code, "F6") == 0) return Event::K_F6;
+  if(std::strcmp(code, "F7") == 0) return Event::K_F7;
+  if(std::strcmp(code, "F8") == 0) return Event::K_F8;
+  if(std::strcmp(code, "F9") == 0) return Event::K_F9;
+  if(std::strcmp(code, "F10") == 0) return Event::K_F10;
+  if(std::strcmp(code, "F11") == 0) return Event::K_F11;
+  if(std::strcmp(code, "F12") == 0) return Event::K_F12;
+  return Event::K_NoKey;
+}
+}
+
+void AndroidApi::pushWebKey(int action, const char* code) {
+  const auto k = mapWebKeyCode(code);
+  if(k==Event::K_NoKey)
+    return;
+  pushKeyEvent(action, 1000+int(k));
   }
 
 void AndroidApi::pushKeyEvent(int action, int keyCode) {
@@ -211,6 +287,9 @@ void AndroidApi::implProcessEvents(AppCallBack& /*cb*/) {
   // Key events handling
   for(const auto& ke : kEvents) {
     Event::KeyType k = Event::K_NoKey;
+    if(ke.keyCode>=1000)
+      k = Event::KeyType(ke.keyCode-1000); // a key of the web page's touch layer
+    else
     switch(ke.keyCode) {
       case 4:   k = Event::K_ESCAPE; break; // KEYCODE_BACK
       case 111: k = Event::K_ESCAPE; break; // KEYCODE_ESCAPE
