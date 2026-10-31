@@ -2,6 +2,7 @@
 
 #include "webdpr.h"
 #include "webgapi.h"
+#include "bc_astc.h"
 
 #include <atomic>
 
@@ -54,6 +55,7 @@ struct Ctx {
   WGPUQueue         queue = nullptr;
   WGPUSupportedLimits limits = {};
   bool              bc            = false;
+  bool              dxtAsAstc     = false; // no BC (phones): DXT textures are transcoded to ASTC 4x4
   bool              f32filter     = false;
   bool              rg11b10render = false;
   bool              firstInstance = false;
@@ -169,9 +171,9 @@ FormatInfo formatInfo(TextureFormat f) {
     case TextureFormat::Depth24x8:r = {WGPUTextureFormat_Depth24Plus,  4, true, false}; r.depth = true; break;
     case TextureFormat::Depth24S8:r = {WGPUTextureFormat_Depth24PlusStencil8, 4, true, false}; r.depth = true; break;
     case TextureFormat::Depth32F: r = {WGPUTextureFormat_Depth32Float, 4, true, false}; r.depth = true; break;
-    case TextureFormat::DXT1:     r = {WGPUTextureFormat_BC1RGBAUnorm, 8,  false, false}; r.compressed = true; break;
-    case TextureFormat::DXT3:     r = {WGPUTextureFormat_BC2RGBAUnorm, 16, false, false}; r.compressed = true; break;
-    case TextureFormat::DXT5:     r = {WGPUTextureFormat_BC3RGBAUnorm, 16, false, false}; r.compressed = true; break;
+    case TextureFormat::DXT1:     r = {g.dxtAsAstc ? WGPUTextureFormat_ASTC4x4Unorm : WGPUTextureFormat_BC1RGBAUnorm, g.dxtAsAstc ? 16u : 8u, false, false}; r.compressed = true; break;
+    case TextureFormat::DXT3:     r = {g.dxtAsAstc ? WGPUTextureFormat_ASTC4x4Unorm : WGPUTextureFormat_BC2RGBAUnorm, g.dxtAsAstc ? 16u : 16u, false, false}; r.compressed = true; break;
+    case TextureFormat::DXT5:     r = {g.dxtAsAstc ? WGPUTextureFormat_ASTC4x4Unorm : WGPUTextureFormat_BC3RGBAUnorm, g.dxtAsAstc ? 16u : 16u, false, false}; r.compressed = true; break;
     default: break;
     }
   return r;
@@ -357,6 +359,8 @@ struct WBuffer : AbstractGraphicsApi::Buffer {
 
 struct WTexture;
 static void unregisterChain(WTexture* t);
+// video memory of all textures / of textures loaded from files (og_gpu_mem for the test page)
+static std::atomic<uint64_t> g_texBytesAll{0}, g_texBytesAsset{0}, g_texCountAsset{0}, g_texBytesRgbaDxt{0}, g_texCountRgbaDxt{0};
 static std::vector<WTexture*> g_chainTex; // compressed textures with a mip chain, see texture quality
 
 struct WTexture : AbstractGraphicsApi::Texture {
@@ -368,6 +372,8 @@ struct WTexture : AbstractGraphicsApi::Texture {
   bool              is3D   = false;
   uint64_t          uid    = 0;
   bool              bound  = false; // used by a recorded render pass command
+  uint64_t          memBytes = 0;
+  bool              asset  = false; // created from a pixmap (file), not a render target
   // texture quality: a compressed texture with a mip chain is sampled starting from viewBase
   bool              chain  = false;
   uint32_t          fullW = 1, fullH = 1, viewBase = 0;
@@ -389,9 +395,21 @@ struct WTexture : AbstractGraphicsApi::Texture {
     td.mipLevelCount = mips;
     td.sampleCount   = 1;
     impl = wgpuDeviceCreateTexture(g.dev, &td);
+
+    uint64_t sum = 0;
+    for(uint32_t m=0, mw=w, mh=h; m<mips; ++m, mw=std::max(1u,mw/2), mh=std::max(1u,mh/2))
+      sum += info.compressed ? uint64_t(std::max(1u,(mw+3)/4))*std::max(1u,(mh+3)/4)*info.bpp
+                             : uint64_t(mw)*mh*info.bpp;
+    memBytes = sum*d;
+    g_texBytesAll += memBytes;
     }
 
   ~WTexture() override {
+    g_texBytesAll -= memBytes;
+    if(asset) {
+      g_texBytesAsset -= memBytes;
+      --g_texCountAsset;
+      }
     if(chain)
       unregisterChain(this);
     if(bound)
@@ -2519,6 +2537,7 @@ WebGapi::WebGapi(ApiFlags) {
   wgpuDeviceSetUncapturedErrorCallback(g.dev, onDeviceError, nullptr);
   wgpuDeviceGetLimits(g.dev, &g.limits);
   g.bc            = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_TextureCompressionBC);
+  g.dxtAsAstc     = !g.bc && wgpuDeviceHasFeature(g.dev, WGPUFeatureName_TextureCompressionASTC);
   g.f32filter     = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_Float32Filterable);
   g.rg11b10render = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_RG11B10UfloatRenderable);
   g.firstInstance = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_IndirectFirstInstance);
@@ -2526,7 +2545,7 @@ WebGapi::WebGapi(ApiFlags) {
     const f = navigator.gpu.getPreferredCanvasFormat();
     return f==='rgba8unorm' ? 0x12 : 0x17;
     }));
-  Log::i("[WebGPU] device ready: bc=", g.bc, " f32filter=", g.f32filter,
+  Log::i("[WebGPU] device ready: bc=", g.bc, " dxtAsAstc=", g.dxtAsAstc, " f32filter=", g.f32filter,
          " rg11b10render=", g.rg11b10render, " firstInstance=", g.firstInstance,
          " maxStorageBuffers=", g.limits.limits.maxStorageBuffersPerShaderStage,
          " maxStorageTextures=", g.limits.limits.maxStorageTexturesPerShaderStage);
@@ -2722,6 +2741,46 @@ AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, const Pixmap& p, T
   if(t->info.compressed && t->mips>p.mipCount())
     t->mips = p.mipCount();
 
+  // no BC on this device (phones): DXT blocks go to ASTC 4x4, 4 times smaller than RGBA8. A texture with blocks
+  // that would not stay exact (alpha varying inside a block: foliage, cut-outs) keeps the old way, RGBA8
+  // with generated mips
+  const bool     isDxt    = (pfrm==TextureFormat::DXT1 || pfrm==TextureFormat::DXT3 || pfrm==TextureFormat::DXT5);
+  const int      dxtKind  = (pfrm==TextureFormat::DXT1) ? 1 : (pfrm==TextureFormat::DXT3 ? 3 : 5);
+  const uint32_t srcBlock = (pfrm==TextureFormat::DXT1) ? 8u : 16u;
+  std::vector<uint8_t> astcData;
+  std::vector<uint8_t> dxtRgba;
+  if(isDxt && g.dxtAsAstc) {
+    const uint8_t* bc = static_cast<const uint8_t*>(p.data());
+    size_t         blocks = 0;
+    for(uint32_t m=0, w=t->w, h=t->h; m<t->mips; ++m, w=std::max(1u,w/2), h=std::max(1u,h/2))
+      blocks += size_t(std::max(1u,(w+3)/4))*std::max(1u,(h+3)/4);
+    astcData.resize(blocks*16);
+    size_t lossy = 0, srcOff = 0, dstOff = 0;
+    for(uint32_t m=0, w=t->w, h=t->h; m<t->mips; ++m, w=std::max(1u,w/2), h=std::max(1u,h/2)) {
+      const size_t nb = size_t(std::max(1u,(w+3)/4))*std::max(1u,(h+3)/4);
+      lossy  += BcAstc::transcode(astcData.data()+dstOff, bc+srcOff, nb, dxtKind);
+      srcOff += nb*srcBlock;
+      dstOff += nb*16;
+      }
+    if(lossy>0) {
+      astcData = std::vector<uint8_t>();
+      const uint32_t bw = std::max(1u,(t->w+3)/4), bh = std::max(1u,(t->h+3)/4);
+      dxtRgba.resize(size_t(bw)*bh*64);
+      for(uint32_t by=0; by<bh; ++by)
+        for(uint32_t bx=0; bx<bw; ++bx) {
+          uint8_t px[64];
+          BcAstc::decodeBlock(px, bc+(size_t(by)*bw+bx)*srcBlock, dxtKind);
+          for(uint32_t y=0; y<4; ++y)
+            std::memcpy(&dxtRgba[((size_t(by)*4+y)*bw*4 + size_t(bx)*4)*4], px+y*16, 16);
+          }
+      t->info = formatInfo(TextureFormat::RGBA8);
+      t->frm  = TextureFormat::RGBA8;
+      t->mips = 1;
+      for(uint32_t m=std::max(t->w,t->h); m>1; m>>=1)
+        ++t->mips;
+      }
+    }
+
   // texture quality: every level is uploaded, so it can be raised again at any time; the top levels
   // are only left out of the sampled view (user interface textures have no chain)
   size_t skipOff = 0;
@@ -2733,11 +2792,26 @@ AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, const Pixmap& p, T
     g_chainTex.push_back(t.get());
     }
   t->create(textureUsage(t->info, false) & (t->info.compressed ? ~WGPUTextureUsageFlags(WGPUTextureUsage_RenderAttachment) : ~0u));
+  t->asset = true;
+  g_texBytesAsset += t->memBytes;
+  ++g_texCountAsset;
+  if(!dxtRgba.empty()) {
+    g_texBytesRgbaDxt += t->memBytes;
+    ++g_texCountRgbaDxt;
+    }
 
   const uint8_t* src = static_cast<const uint8_t*>(p.data());
   std::vector<uint8_t> cvt;
   const size_t n = size_t(p.w())*p.h();
-  if(pfrm==TextureFormat::R8) {
+  if(!dxtRgba.empty()) {
+    // the blocks cover whole 4x4 texels: crop to the size of the texture row by row
+    const uint32_t bw = std::max(1u,(t->w+3)/4);
+    cvt.resize(size_t(t->w)*t->h*4);
+    for(uint32_t y=0; y<t->h; ++y)
+      std::memcpy(&cvt[size_t(y)*t->w*4], &dxtRgba[size_t(y)*bw*16], size_t(t->w)*4);
+    src = cvt.data();
+    }
+  else if(pfrm==TextureFormat::R8) {
     cvt.resize(n*4);
     for(size_t i=0; i<n; ++i) {
       cvt[i*4+0] = src[i]; cvt[i*4+1] = src[i]; cvt[i*4+2] = src[i]; cvt[i*4+3] = 255;
@@ -2771,9 +2845,10 @@ AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, const Pixmap& p, T
   if(t->info.compressed) {
     uint32_t w = t->w, h = t->h;
     size_t   off = skipOff;
+    size_t   dstOff = 0;
     for(uint32_t m=0; m<t->mips; ++m) {
       const uint32_t bw = std::max(1u, (w+3)/4), bh = std::max(1u, (h+3)/4);
-      const size_t   sz = size_t(bw)*bh*t->info.bpp;
+      const size_t   sz = size_t(bw)*bh*srcBlock;
       WGPUImageCopyTexture dst = {};
       dst.texture  = t->impl;
       dst.mipLevel = m;
@@ -2783,7 +2858,13 @@ AbstractGraphicsApi::PTexture WebGapi::createTexture(Device*, const Pixmap& p, T
       dl.bytesPerRow  = bw*t->info.bpp;
       dl.rowsPerImage = bh;
       WGPUExtent3D ext = {bw*4, bh*4, 1};
-      wgpuQueueWriteTexture(g.queue, &dst, src+off, sz, &dl, &ext);
+      if(!astcData.empty()) {
+        const size_t asz = size_t(bw)*bh*16;
+        wgpuQueueWriteTexture(g.queue, &dst, astcData.data()+dstOff, asz, &dl, &ext);
+        dstOff += asz;
+        } else {
+        wgpuQueueWriteTexture(g.queue, &dst, src+off, sz, &dl, &ext);
+        }
       off += sz;
       w = std::max(1u, w/2);
       h = std::max(1u, h/2);
@@ -3021,7 +3102,7 @@ void WebGapi::getCaps(Device*, Props& props) {
                  bit(R32F) | bit(RG32F) | bit(RGBA32F) | bit(R32U) | bit(RG32U) | bit(RGBA32U) |
                  bit(Depth16) | bit(Depth24x8) | bit(Depth24S8) | bit(Depth32F) |
                  bit(R11G11B10UF) | bit(RGBA16F);
-  if(g.bc)
+  if(g.bc || g.dxtAsAstc)
     smp |= bit(DXT1) | bit(DXT3) | bit(DXT5);
   uint64_t att = bit(R8) | bit(RG8) | bit(RGBA8) | bit(R16) | bit(RG16) | bit(RGBA16) |
                  bit(R32F) | bit(RG32F) | bit(RGBA32F) | bit(R32U) | bit(RG32U) | bit(RGBA32U) | bit(RGBA16F);
@@ -3035,6 +3116,16 @@ void WebGapi::getCaps(Device*, Props& props) {
   props.setDepthFormats(dep);
   props.setStorageFormats(sto);
   props.setAtomicFormats(0);
+  }
+
+extern "C" EMSCRIPTEN_KEEPALIVE double og_gpu_mem(int kind) {
+  switch(kind) {
+    case 0:  return double(g_texBytesAll.load());
+    case 1:  return double(g_texBytesAsset.load());
+    case 3:  return double(g_texBytesRgbaDxt.load());
+    case 4:  return double(g_texCountRgbaDxt.load());
+    default: return double(g_texCountAsset.load());
+    }
   }
 
 #endif // __EMSCRIPTEN__
