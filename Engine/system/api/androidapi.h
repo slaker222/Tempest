@@ -50,6 +50,7 @@ class AndroidApi final: public SystemApi {
     static void  setDensity(float density); // screen density (px per dp), for the interface scale
     static void  pushTouchEvent(int action, float x, float y, int id);
     static void  pushKeyEvent(int action, int keyCode);
+    static bool  exitRequested() { return isExit.load(); } // the game asked to quit (menu "Exit", script exitgame)
     static void  setDeviceLostHandler(void (*fn)()); // the gpu driver lost the device (a hang): the app lowers its settings and ends
     static void  pushWebKey(int action, const char* code); // 0 down, 1 up; code: KeyboardEvent.code of the web page's touch layer
     static void  pushMouseEvent(int action, int button, int x, int y);
