@@ -2537,7 +2537,12 @@ WebGapi::WebGapi(ApiFlags) {
   wgpuDeviceSetUncapturedErrorCallback(g.dev, onDeviceError, nullptr);
   wgpuDeviceGetLimits(g.dev, &g.limits);
   g.bc            = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_TextureCompressionBC);
-  g.dxtAsAstc     = !g.bc && wgpuDeviceHasFeature(g.dev, WGPUFeatureName_TextureCompressionASTC);
+  // iPhone / iPad: the GPU has no BC; Safari lists the feature anyway (it decodes in software: 4x the memory, slow uploads) -
+  // the native ASTC is used there, like on Android
+  const bool ios  = EM_ASM_INT({ const u = navigator.userAgent; return (/iPhone|iPad|iPod/.test(u) || (/Macintosh/.test(u) && navigator.maxTouchPoints > 1)) ? 1 : 0; })!=0;
+  g.dxtAsAstc     = (!g.bc || ios) && wgpuDeviceHasFeature(g.dev, WGPUFeatureName_TextureCompressionASTC);
+  if(g.dxtAsAstc)
+    g.bc = false;
   g.f32filter     = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_Float32Filterable);
   g.rg11b10render = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_RG11B10UfloatRenderable);
   g.firstInstance = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_IndirectFirstInstance);
