@@ -1843,8 +1843,10 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
 
     const uint64_t hash = KeyHash()(key);
     ++g.st.bgLookups;
-    if(auto found = g_bindGroups.find(key, hash))
-      return found;
+    if(!(g.dbg & 64)) { // 64: debug, no bind group cache
+      if(auto found = g_bindGroups.find(key, hash))
+        return found;
+      }
     ++g.st.bgCreated;
     if(g_bindGroups.size()>16384) {
       g_bindGroups.clear([](WGPUBindGroup bg){ g.deadBg.push_back(bg); });
@@ -1856,8 +1858,12 @@ struct WCommandBuffer : AbstractGraphicsApi::CommandBuffer {
     d.entries    = e.data();
     (void)tag;
     auto bg = wgpuDeviceCreateBindGroup(g.dev, &d);
-    if(bg!=nullptr)
-      g_bindGroups.insert(key, hash, bg);
+    if(bg!=nullptr) {
+      if(g.dbg & 64)
+        g.deadBg.push_back(bg);
+      else
+        g_bindGroups.insert(key, hash, bg);
+      }
     return bg;
     }
 
@@ -2543,6 +2549,10 @@ WebGapi::WebGapi(ApiFlags) {
   g.dxtAsAstc     = (!g.bc || ios) && wgpuDeviceHasFeature(g.dev, WGPUFeatureName_TextureCompressionASTC);
   if(g.dxtAsAstc)
     g.bc = false;
+  if(EM_ASM_INT({ return window.__ogNoAstc ? 1 : 0; })) { // ?noastc: DXT textures are decoded to RGBA8 (debug)
+    g.bc = false;
+    g.dxtAsAstc = false;
+    }
   g.f32filter     = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_Float32Filterable);
   g.rg11b10render = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_RG11B10UfloatRenderable);
   g.firstInstance = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_IndirectFirstInstance);
