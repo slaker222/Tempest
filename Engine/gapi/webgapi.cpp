@@ -5,6 +5,8 @@
 #include "bc_astc.h"
 
 #include <atomic>
+#include <malloc.h>
+#include <emscripten/heap.h>
 
 #include <Tempest/Log>
 #include <Tempest/Pixmap>
@@ -293,6 +295,8 @@ struct WDevice : AbstractGraphicsApi::Device {
   void waitIdle() override {}
   };
 
+static std::atomic<uint64_t> g_bufBytes{0}, g_bufShadow{0}, g_bufCount{0};
+
 struct WBuffer : AbstractGraphicsApi::Buffer {
   WGPUBuffer           impl  = nullptr;
   bool                 bound = false; // used by a recorded render pass command
@@ -314,13 +318,21 @@ struct WBuffer : AbstractGraphicsApi::Buffer {
     d.size  = alloc;
     d.mappedAtCreation = false;
     impl = wgpuDeviceCreateBuffer(g.dev, &d);
-    if(heap!=BufferHeap::Device)
+    if(heap!=BufferHeap::Device) {
       shadow.resize(size_t(alloc), 0);
+      g_bufShadow += alloc;
+      }
+    g_bufBytes += alloc;
+    ++g_bufCount;
     if(mem!=nullptr && sz>0)
       update(mem, 0, sz);
     }
 
   ~WBuffer() override {
+    g_bufBytes -= alloc;
+    g_bufCount -= 1;
+    if(!shadow.empty())
+      g_bufShadow -= alloc;
     if(bound)
       ++g.resGen;
     if(impl!=nullptr)
@@ -3046,6 +3058,7 @@ void WebGapi::present(Device*, Swapchain* sw) {
            " draws=", g.st.draws, " skipped=", g.st.skipped, " dispatch=", g.st.dispatches,
            " submits=", g.st.submits, " bg=", g.st.bgLookups, "/", g.st.bgCreated, " bundles=", g.st.bundles,
            " spec=", g.st.specHit, "/", g.st.specMiss, " chains=", g.st.chainHits, "/", g.st.chainChecked, "/", g.st.chainWrong, " wb=", g.st.wbCalls, "/", uint32_t(g.st.wbBytes>>10), "K resGen=", g.resGen, " errors=", g.errors);
+  Log::i("[mem] frame ", g.frame, " heapUsed=", uint32_t(mallinfo().uordblks>>20), "M heapSize=", uint32_t(emscripten_get_heap_size()>>20), "M texAll=", uint32_t(g_texBytesAll.load()>>20), "M bufs=", uint32_t(g_bufBytes.load()>>20), "M/", uint32_t(g_bufCount.load()), " shadow=", uint32_t(g_bufShadow.load()>>20), "M");
     }
   g.st = Ctx::Stats();
   g.dbg = EM_ASM_INT({ window.__ogFrame = $0; return (typeof window.__OG_GAPI_DEBUG === 'number') ? window.__OG_GAPI_DEBUG : 0; }, g.frame);
