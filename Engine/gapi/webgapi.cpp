@@ -77,6 +77,7 @@ struct Ctx {
   std::vector<WGPUBuffer>  deadBuf;
   // dropped from the bind group cache: recorded pass commands may still use them
   std::vector<WGPUBindGroup> deadBg;
+  std::vector<WGPUTextureView> deadView; // debug 256: views live one frame
 
   // mip generation
   WGPUShaderModule  blitModule = nullptr;
@@ -440,7 +441,7 @@ struct WTexture : AbstractGraphicsApi::Texture {
       return allMips[dim];
     const uint32_t key = (mip==uint32_t(-1) ? 0xFFFFu : (mip & 0xFFFFu)) | (uint32_t(dim)<<16);
     auto it = views.find(key);
-    if(it!=views.end())
+    if(it!=views.end() && !(g.dbg & 256))
       return it->second;
     WGPUTextureViewDescriptor vd = {};
     vd.format          = info.wgpu;
@@ -451,6 +452,10 @@ struct WTexture : AbstractGraphicsApi::Texture {
     vd.arrayLayerCount = 1;
     vd.aspect          = info.depth ? WGPUTextureAspect_DepthOnly : WGPUTextureAspect_All;
     auto v = wgpuTextureCreateView(impl, &vd);
+    if(g.dbg & 256) { // views are not kept: a new one for every use, released after the frame
+      g.deadView.push_back(v);
+      return v;
+      }
     views[key] = v;
     if(all)
       allMips[dim] = v;
@@ -2551,7 +2556,7 @@ WebGapi::WebGapi(ApiFlags) {
   g.bc            = wgpuDeviceHasFeature(g.dev, WGPUFeatureName_TextureCompressionBC);
   // iPhone / iPad: the GPU has no BC; Safari lists the feature anyway (it decodes in software: 4x the memory, slow uploads) -
   // the native ASTC is used there, like on Android
-  const bool ios  = EM_ASM_INT({ const u = navigator.userAgent; return (/iPhone|iPad|iPod/.test(u) || (/Macintosh/.test(u) && navigator.maxTouchPoints > 1)) ? 1 : 0; })!=0;
+  const bool ios  = !EM_ASM_INT({ return window.__ogForceBC ? 1 : 0; }) && EM_ASM_INT({ const u = navigator.userAgent; return (/iPhone|iPad|iPod/.test(u) || (/Macintosh/.test(u) && navigator.maxTouchPoints > 1)) ? 1 : 0; })!=0;
   g.dxtAsAstc     = (!g.bc || ios) && wgpuDeviceHasFeature(g.dev, WGPUFeatureName_TextureCompressionASTC);
   if(g.dxtAsAstc)
     g.bc = false;
@@ -3058,7 +3063,8 @@ void WebGapi::present(Device*, Swapchain* sw) {
   g.dbg = EM_ASM_INT({ window.__ogFrame = $0; return (typeof window.__OG_GAPI_DEBUG === 'number') ? window.__OG_GAPI_DEBUG : 0; }, g.frame);
   static_cast<WSwapchain*>(sw)->presented();
   for(auto t:g.deadTex) {
-    wgpuTextureDestroy(t);
+    if(!(g.dbg & 128)) // 128 (debug): no explicit destroy, the release frees it
+      wgpuTextureDestroy(t);
     wgpuTextureRelease(t);
     }
   g.deadTex.clear();
@@ -3073,6 +3079,9 @@ void WebGapi::present(Device*, Swapchain* sw) {
   for(auto b:g.deadBg)
     wgpuBindGroupRelease(b);
   g.deadBg.clear();
+  for(auto v:g.deadView)
+    wgpuTextureViewRelease(v);
+  g.deadView.clear();
   }
 
 std::shared_ptr<AbstractGraphicsApi::Fence> WebGapi::submit(Device*, CommandBuffer* cmd) {
